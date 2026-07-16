@@ -498,8 +498,8 @@ static int hwBreakpointProc_release(struct inode *inode, struct file *filp) {
 
 static int hwBreakpointProc_dev_init(void) {
 #ifdef CONFIG_KALLSYMS_LOOKUP_NAME
-	if(!init_kallsyms_lookup()) {
-		printk(KERN_EMERG "init_kallsyms_lookup failed\n");
+	if (!init_kallsyms_lookup()) {
+		printk(KERN_EMERG "hwbp: init_kallsyms_lookup failed\n");
 		return -EBADF;
 	}
 #endif
@@ -511,51 +511,69 @@ static int hwBreakpointProc_dev_init(void) {
 #endif
 
 	g_hwBreakpointProc_devp = x_kmalloc(sizeof(struct hwBreakpointProcDev), GFP_KERNEL);
+	if (!g_hwBreakpointProc_devp) {
+		printk(KERN_EMERG "hwbp: kmalloc failed\n");
+		return -ENOMEM;
+	}
 	memset(g_hwBreakpointProc_devp, 0, sizeof(struct hwBreakpointProcDev));
 
 #ifdef CONFIG_USE_PROC_FILE_NODE
 	g_hwBreakpointProc_devp->proc_parent = proc_mkdir(CONFIG_PROC_NODE_AUTH_KEY, NULL);
-	if(g_hwBreakpointProc_devp->proc_parent) {
-		g_hwBreakpointProc_devp->proc_entry = proc_create(CONFIG_PROC_NODE_AUTH_KEY, S_IRUGO | S_IWUGO, g_hwBreakpointProc_devp->proc_parent, &hwBreakpointProc_proc_ops);
-		start_hide_procfs_dir(CONFIG_PROC_NODE_AUTH_KEY);
+	if (!g_hwBreakpointProc_devp->proc_parent) {
+		printk(KERN_EMERG "hwbp: proc_mkdir failed for %s\n", CONFIG_PROC_NODE_AUTH_KEY);
+		kfree(g_hwBreakpointProc_devp);
+		g_hwBreakpointProc_devp = NULL;
+		return -ENOMEM;
+	}
+	g_hwBreakpointProc_devp->proc_entry = proc_create(CONFIG_PROC_NODE_AUTH_KEY, S_IRUGO | S_IWUGO, g_hwBreakpointProc_devp->proc_parent, &hwBreakpointProc_proc_ops);
+	if (!g_hwBreakpointProc_devp->proc_entry) {
+		printk(KERN_EMERG "hwbp: proc_create failed for %s\n", CONFIG_PROC_NODE_AUTH_KEY);
+		proc_remove(g_hwBreakpointProc_devp->proc_parent);
+		g_hwBreakpointProc_devp->proc_parent = NULL;
+		kfree(g_hwBreakpointProc_devp);
+		g_hwBreakpointProc_devp = NULL;
+		return -ENOMEM;
+	}
+#ifdef CONFIG_HIDE_PROCFS_DIR
+	if (!start_hide_procfs_dir(CONFIG_PROC_NODE_AUTH_KEY)) {
+		printk(KERN_EMERG "hwbp: hide_procfs_dir failed, continue without hide\n");
 	}
 #endif
-
-#ifdef DEBUG_PRINTK
-	printk(KERN_EMERG "Hello, %s debug\n", CONFIG_PROC_NODE_AUTH_KEY);
-	//test1();
-	//test2();
-	//test3();
-	//test4();
-#else
-	printk(KERN_EMERG "Hello\n");
+	printk(KERN_EMERG "hwbp: proc ready /proc/%s/%s\n",
+	       CONFIG_PROC_NODE_AUTH_KEY, CONFIG_PROC_NODE_AUTH_KEY);
 #endif
+
+	printk(KERN_EMERG "Hello, %s\n", CONFIG_PROC_NODE_AUTH_KEY);
 	return 0;
 }
 
 static void hwBreakpointProc_dev_exit(void) {
-	
 #ifdef CONFIG_ANTI_PTRACE_DETECTION_MODE
 	stop_anti_ptrace_detection();
 #endif
 
 	clean_hwbp();
-	
 	mutex_destroy(&g_hwbp_handle_info_mutex);
-	
+
 #ifdef CONFIG_USE_PROC_FILE_NODE
-	if(g_hwBreakpointProc_devp->proc_entry) {
-		proc_remove(g_hwBreakpointProc_devp->proc_entry);
-		g_hwBreakpointProc_devp->proc_entry = NULL;
+	if (g_hwBreakpointProc_devp) {
+		if (g_hwBreakpointProc_devp->proc_entry) {
+			proc_remove(g_hwBreakpointProc_devp->proc_entry);
+			g_hwBreakpointProc_devp->proc_entry = NULL;
+		}
+		if (g_hwBreakpointProc_devp->proc_parent) {
+			proc_remove(g_hwBreakpointProc_devp->proc_parent);
+			g_hwBreakpointProc_devp->proc_parent = NULL;
+		}
 	}
-	
-	if(g_hwBreakpointProc_devp->proc_parent) {
-		proc_remove(g_hwBreakpointProc_devp->proc_parent);
-		g_hwBreakpointProc_devp->proc_parent = NULL;
-	}
+#ifdef CONFIG_HIDE_PROCFS_DIR
 	stop_hide_procfs_dir();
 #endif
-	kfree(g_hwBreakpointProc_devp);
+#endif
+	if (g_hwBreakpointProc_devp) {
+		kfree(g_hwBreakpointProc_devp);
+		g_hwBreakpointProc_devp = NULL;
+	}
 	printk(KERN_EMERG "Goodbye\n");
 }
 

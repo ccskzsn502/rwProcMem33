@@ -4,13 +4,16 @@
 // �����ں�ģ�����ģʽ
 #define CONFIG_MODULE_GUIDE_ENTRY
 
-// ����proc�û��㽻���ڵ��ļ�
+// 生成proc用户层交互节点文件
 #define CONFIG_USE_PROC_FILE_NODE
-// ����ͨ����Կ
+// 隐蔽通信密钥
 #define CONFIG_PROC_NODE_AUTH_KEY "e84523d7b60d5d341a7c4d1861773ecd"
 
-// ��ӡ�ں˵�����Ϣ
-//#define CONFIG_DEBUG_PRINTK
+// 调试打印（排查加载/死机时打开）
+#define CONFIG_DEBUG_PRINTK
+
+// kprobe 隐藏 /proc 目录在 CFI 内核上易触发崩溃，默认关闭
+// #define CONFIG_HIDE_PROCFS_DIR
 
 #ifndef KERNEL_VERSION
 #define KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + (c))

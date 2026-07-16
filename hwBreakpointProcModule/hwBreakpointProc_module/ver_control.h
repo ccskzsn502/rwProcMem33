@@ -5,13 +5,16 @@
 // 独立内核模块入口模式
 #define CONFIG_MODULE_GUIDE_ENTRY
 
-// 生成proc用户层交互节点文�?
+// 生成proc用户层交互节点文件
 #define CONFIG_USE_PROC_FILE_NODE
 // 隐蔽通信密钥
 #define CONFIG_PROC_NODE_AUTH_KEY "dce3771681d4c7a143d5d06b7d32548e"
 
-// 调试打印模式
-//#define CONFIG_DEBUG_PRINTK
+// 调试打印（排查加载/死机时打开）
+#define CONFIG_DEBUG_PRINTK
+
+// kprobe 隐藏 /proc 目录在 CFI 内核上易触发崩溃，默认关闭
+// #define CONFIG_HIDE_PROCFS_DIR
 
 // 动态寻址模式
 #define CONFIG_KALLSYMS_LOOKUP_NAME

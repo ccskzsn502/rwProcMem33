@@ -330,43 +330,62 @@ static ssize_t rwProcMem_read(struct file* filp,
 
 static int rwProcMem_dev_init(void) {
 	g_rwProcMem_devp = x_kmalloc(sizeof(struct rwProcMemDev), GFP_KERNEL);
+	if (!g_rwProcMem_devp) {
+		printk(KERN_EMERG "rwProcMem: kmalloc failed\n");
+		return -ENOMEM;
+	}
 	memset(g_rwProcMem_devp, 0, sizeof(struct rwProcMemDev));
 
 #ifdef CONFIG_USE_PROC_FILE_NODE
 	g_rwProcMem_devp->proc_parent = proc_mkdir(CONFIG_PROC_NODE_AUTH_KEY, NULL);
-	if(g_rwProcMem_devp->proc_parent) {
-		g_rwProcMem_devp->proc_entry = proc_create(CONFIG_PROC_NODE_AUTH_KEY, S_IRUGO | S_IWUGO, g_rwProcMem_devp->proc_parent, &rwProcMem_proc_ops);
-		start_hide_procfs_dir(CONFIG_PROC_NODE_AUTH_KEY);
+	if (!g_rwProcMem_devp->proc_parent) {
+		printk(KERN_EMERG "rwProcMem: proc_mkdir failed for %s\n", CONFIG_PROC_NODE_AUTH_KEY);
+		kfree(g_rwProcMem_devp);
+		g_rwProcMem_devp = NULL;
+		return -ENOMEM;
+	}
+	g_rwProcMem_devp->proc_entry = proc_create(CONFIG_PROC_NODE_AUTH_KEY, S_IRUGO | S_IWUGO, g_rwProcMem_devp->proc_parent, &rwProcMem_proc_ops);
+	if (!g_rwProcMem_devp->proc_entry) {
+		printk(KERN_EMERG "rwProcMem: proc_create failed for %s\n", CONFIG_PROC_NODE_AUTH_KEY);
+		proc_remove(g_rwProcMem_devp->proc_parent);
+		g_rwProcMem_devp->proc_parent = NULL;
+		kfree(g_rwProcMem_devp);
+		g_rwProcMem_devp = NULL;
+		return -ENOMEM;
+	}
+#ifdef CONFIG_HIDE_PROCFS_DIR
+	if (!start_hide_procfs_dir(CONFIG_PROC_NODE_AUTH_KEY)) {
+		printk(KERN_EMERG "rwProcMem: hide_procfs_dir failed, continue without hide\n");
 	}
 #endif
-
-#ifdef CONFIG_DEBUG_PRINTK
-	printk(KERN_EMERG "Hello, %s debug\n", CONFIG_PROC_NODE_AUTH_KEY);
-	//test1();
-	//test2();
-	//test3();
-	//test4();
-	//test5();
-#else
-	printk(KERN_EMERG "Hello\n");
+	printk(KERN_EMERG "rwProcMem: proc ready /proc/%s/%s\n",
+	       CONFIG_PROC_NODE_AUTH_KEY, CONFIG_PROC_NODE_AUTH_KEY);
 #endif
+
+	printk(KERN_EMERG "Hello, %s\n", CONFIG_PROC_NODE_AUTH_KEY);
 	return 0;
 }
 
 static void rwProcMem_dev_exit(void) {
 #ifdef CONFIG_USE_PROC_FILE_NODE
-	if(g_rwProcMem_devp->proc_entry) {
-		proc_remove(g_rwProcMem_devp->proc_entry);
-		g_rwProcMem_devp->proc_entry = NULL;
+	if (g_rwProcMem_devp) {
+		if (g_rwProcMem_devp->proc_entry) {
+			proc_remove(g_rwProcMem_devp->proc_entry);
+			g_rwProcMem_devp->proc_entry = NULL;
+		}
+		if (g_rwProcMem_devp->proc_parent) {
+			proc_remove(g_rwProcMem_devp->proc_parent);
+			g_rwProcMem_devp->proc_parent = NULL;
+		}
 	}
-	
-	if(g_rwProcMem_devp->proc_parent) {
-		proc_remove(g_rwProcMem_devp->proc_parent);
-		g_rwProcMem_devp->proc_parent = NULL;
-	}
+#ifdef CONFIG_HIDE_PROCFS_DIR
 	stop_hide_procfs_dir();
 #endif
-	kfree(g_rwProcMem_devp);
+#endif
+	if (g_rwProcMem_devp) {
+		kfree(g_rwProcMem_devp);
+		g_rwProcMem_devp = NULL;
+	}
 	printk(KERN_EMERG "Goodbye\n");
 }
 
