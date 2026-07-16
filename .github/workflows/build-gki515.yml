@@ -27,20 +27,24 @@ jobs:
             xz-utils lz4 zstd dwarves \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             clang-14 lld-14 llvm-14
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-14 100
-          sudo update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-14 100
-          sudo update-alternatives --install /usr/bin/llvm-ar llvm-ar /usr/bin/llvm-ar-14 100
-          sudo update-alternatives --install /usr/bin/llvm-nm llvm-nm /usr/bin/llvm-nm-14 100
-          sudo update-alternatives --install /usr/bin/llvm-objcopy llvm-objcopy /usr/bin/llvm-objcopy-14 100
-          sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-14 100
+          for tool in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip llvm-readelf; do
+            if [ -x "/usr/bin/${tool}-14" ]; then
+              sudo ln -sfn "/usr/bin/${tool}-14" "/usr/bin/${tool}"
+            fi
+          done
+          if [ -d /usr/lib/llvm-14/bin ]; then
+            echo "/usr/lib/llvm-14/bin" >> "$GITHUB_PATH"
+            export PATH="/usr/lib/llvm-14/bin:$PATH"
+          fi
           clang --version
+          command -v llvm-objdump
           ld.lld --version
       - name: Cache GKI sources
         id: cache-kernel
         uses: actions/cache@v4
         with:
           path: kernel/common
-          key: gki-common-android13-5.15-742fd6fce289-v2
+          key: gki-common-android13-5.15-742fd6fce289-modsym-v4
       - name: Fetch Google kernel/common GKI
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
@@ -56,9 +60,10 @@ jobs:
             git checkout --force FETCH_HEAD
           fi
           git log -1 --oneline
-      - name: modules_prepare
+      - name: Configure and generate real Module.symvers
         run: |
           set -eux
+          export PATH="/usr/lib/llvm-14/bin:$PATH"
           cd kernel/common
           if [ -f arch/arm64/configs/gki_defconfig ]; then
             make LLVM=1 ARCH=arm64 gki_defconfig
@@ -72,6 +77,7 @@ jobs:
           scripts/config --enable CONFIG_KALLSYMS || true
           scripts/config --enable CONFIG_KALLSYMS_ALL || true
           scripts/config --enable CONFIG_PERF_EVENTS || true
+          scripts/config --enable CONFIG_HW_BREAKPOINT || true
           scripts/config --disable CONFIG_MODULE_SIG_FORCE || true
           scripts/config --disable CONFIG_TRIM_UNUSED_KSYMS || true
           scripts/config --disable CONFIG_LTO_CLANG_FULL || true
@@ -80,9 +86,19 @@ jobs:
           scripts/config --disable CONFIG_CFI_CLANG || true
           scripts/config --disable CONFIG_CFI || true
           make LLVM=1 ARCH=arm64 olddefconfig
-          make LLVM=1 ARCH=arm64 modules_prepare -j"$(nproc)"
+          make LLVM=1 ARCH=arm64 prepare modules_prepare -j"$(nproc)"
+
+          # Empty Module.symvers makes modpost report every symbol as undefined.
+          # Building in-tree modules generates a real Module.symvers export table.
+          if [ ! -s Module.symvers ]; then
+            echo "Building in-tree modules to generate Module.symvers (required for OOT .ko)..."
+            make LLVM=1 ARCH=arm64 modules -j"$(nproc)"
+          fi
+
           test -f include/generated/autoconf.h
-          test -f Module.symvers || touch Module.symvers
+          test -s Module.symvers
+          wc -l Module.symvers
+          head -n 5 Module.symvers
       - name: Force version macros 5.15.189
         run: |
           set -eux
@@ -96,7 +112,9 @@ jobs:
       - name: Build both .ko
         run: |
           set -eux
+          export PATH="/usr/lib/llvm-14/bin:$PATH"
           KDIR="$GITHUB_WORKSPACE/kernel/common"
+          test -s "$KDIR/Module.symvers"
           for MDIR in \
             "$GITHUB_WORKSPACE/driver/hwBreakpointProcModule/hwBreakpointProc_module" \
             "$GITHUB_WORKSPACE/driver/rwProcMem33Module/rwProcMem_module"
@@ -114,6 +132,7 @@ jobs:
             echo "gki_commit_requested=${GKI_COMMIT}"
             echo "gki_commit_built=$(git -C kernel/common rev-parse HEAD)"
             echo "clang=$(clang --version | head -n1)"
+            echo "module_symvers_lines=$(wc -l < kernel/common/Module.symvers)"
             echo "warning=CI builds OOT modules with CFI/LTO disabled; device image may still mismatch"
           } | tee out/ko/BUILD_INFO.txt
           ls -la out/ko
