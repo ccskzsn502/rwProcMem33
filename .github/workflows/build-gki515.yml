@@ -44,7 +44,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: kernel/common
-          key: gki-common-android13-5.15-742fd6fce289-modsym-emptycrc-cfi-v2
+          key: gki-common-android13-5.15-742fd6fce289-modsym-emptycrc-cfithinlto-v3
       - name: Fetch Google kernel/common GKI
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
@@ -80,21 +80,24 @@ jobs:
           scripts/config --enable CONFIG_HW_BREAKPOINT || true
           scripts/config --disable CONFIG_MODULE_SIG_FORCE || true
           scripts/config --disable CONFIG_TRIM_UNUSED_KSYMS || true
-          # Empty-CRC OOT (hide Module.symvers) like lsnbm. Keep CFI enabled in
-          # modules_prepare so struct module has init at +0x178 and OOT modules
-          # emit __cfi_check / .cfi_jt (required by loader on this GKI).
-          # Disable LTO only to keep modules_prepare light.
+          # Empty-CRC OOT (hide Module.symvers) like lsnbm.
+          # On GKI 5.15, CONFIG_CFI_CLANG depends on LTO_CLANG. Without CFI:
+          #  - struct module init lands at +0x170 (device expects +0x178)
+          #  - OOT ko lacks __cfi_check / JT → loader CFI-call of init reboots
           scripts/config --enable CONFIG_KPROBES || true
           scripts/config --enable CONFIG_MODVERSIONS || true
+          scripts/config --disable CONFIG_LTO_NONE || true
           scripts/config --disable CONFIG_LTO_CLANG_FULL || true
-          scripts/config --enable CONFIG_LTO_NONE || true
-          scripts/config --disable CONFIG_LTO_CLANG_THIN || true
-          scripts/config --disable CONFIG_LTO_CLANG || true
-          scripts/config --disable CONFIG_LTO || true
+          scripts/config --enable CONFIG_LTO_CLANG_THIN || true
+          scripts/config --enable CONFIG_LTO_CLANG || true
+          scripts/config --enable CONFIG_LTO || true
           scripts/config --enable CONFIG_CFI_CLANG || true
           scripts/config --enable CONFIG_CFI_CLANG_SHADOW || true
           make LLVM=1 ARCH=arm64 olddefconfig
           grep -E 'CONFIG_LTO|CONFIG_CFI|CONFIG_MODVERSIONS|CONFIG_KPROBES' .config | head -n 40 || true
+          # Fail fast if CFI did not stick (usually LTO dependency).
+          grep -q '^CONFIG_CFI_CLANG=y' .config
+          grep -qE '^CONFIG_LTO_CLANG(_THIN)?=y|^CONFIG_LTO_CLANG=y' .config || grep -q '^CONFIG_LTO_CLANG_THIN=y' .config
           make LLVM=1 ARCH=arm64 prepare modules_prepare -j"$(nproc)"
 
           # modules_prepare alone may leave empty Module.symvers; generate one
@@ -164,27 +167,29 @@ jobs:
           ls -la "$GITHUB_WORKSPACE/out/ko"
           python3 - <<'PY'
           from pathlib import Path
-          import os, struct
-          try:
-              from elftools.elf.elffile import ELFFile
-          except ImportError:
-              import subprocess, sys
-              subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pyelftools', '-q'])
-              from elftools.elf.elffile import ELFFile
+          import os, struct, subprocess
           out = Path(os.environ['GITHUB_WORKSPACE']) / 'out' / 'ko'
           for p in sorted(out.glob('*.ko')):
               b = p.read_bytes()
-              print(p.name, 'size', len(b), 'cfi_check', b.count(b'__cfi_check'), 'stack_chk_guard', b.count(b'__stack_chk_guard'))
-              with open(p, 'rb') as f:
-                  elf = ELFFile(f)
-                  rela = elf.get_section_by_name('.rela.gnu.linkonce.this_module')
-                  symtab = elf.get_section_by_name('.symtab')
-                  if rela and symtab:
-                      for r in rela.iter_relocations():
-                          name = symtab.get_symbol(r['r_info_sym']).name
-                          print('  this_module reloc', name, hex(r['r_offset']))
-                  has_cfi = any(s.name == '__cfi_check' for s in (symtab.iter_symbols() if symtab else []))
-                  print('  has_symbol___cfi_check', has_cfi)
+              print(p.name, 'size', len(b),
+                    'cfi_check_str', b.count(b'__cfi_check'),
+                    'cfi_jt_str', b.count(b'.cfi_jt') + b.count(b'__cfi_jt'),
+                    'stack_chk_guard', b.count(b'__stack_chk_guard'))
+              # Prefer llvm-readelf for init reloc offset (no pip deps).
+              try:
+                  r = subprocess.check_output(['llvm-readelf', '-r', str(p)], text=True, errors='replace')
+                  for line in r.splitlines():
+                      if 'this_module' in line or 'init_module' in line or 'cleanup_module' in line:
+                          print(' ', line.strip())
+              except Exception as e:
+                  print('  readelf note:', e)
+              try:
+                  s = subprocess.check_output(['llvm-nm', str(p)], text=True, errors='replace')
+                  for line in s.splitlines():
+                      if '__cfi_check' in line or 'init_module' in line or 'cleanup_module' in line:
+                          print('  nm', line.strip())
+              except Exception as e:
+                  print('  nm note:', e)
           PY
       - uses: actions/upload-artifact@v4
         with:
