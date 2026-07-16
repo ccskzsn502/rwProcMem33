@@ -155,14 +155,19 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/out/ko"
           cp -v "$GITHUB_WORKSPACE/driver/hwBreakpointProcModule/hwBreakpointProc_module/"*.ko "$GITHUB_WORKSPACE/out/ko/"
           cp -v "$GITHUB_WORKSPACE/driver/rwProcMem33Module/rwProcMem_module/"*.ko "$GITHUB_WORKSPACE/out/ko/"
+          # Device-proven: bare RET in __cfi_check reboots; PAC landing pad works.
+          # Patch module __cfi_check/__cfi_check_fail to: paciasp; autiasp; ret
+          python3 "$GITHUB_WORKSPACE/driver/scripts/patch_module_cfi_landing.py" --in-place \
+            "$GITHUB_WORKSPACE/out/ko/"*.ko
           {
             echo "device=Redmi K60 Pro"
             echo "uname=5.15.189-android13-8-00012-g742fd6fce289-ab14327796"
             echo "gki_commit_requested=${GKI_COMMIT}"
             echo "gki_commit_built=$(git -C "$GITHUB_WORKSPACE/kernel/common" rev-parse HEAD)"
             echo "clang=$(clang --version | head -n1)"
-            echo "build_style=lsnbm-empty-crc+cfi-prepare+runtime-slowpath-patch"
-            echo "warning=Empty CRC ko; load without CRC patch. Expect init@0x178 and __cfi_check. Init patches __cfi_slowpath_diag if present."
+            echo "build_style=lsnbm-empty-crc+cfi-prepare+pac-landing-cfi-check+runtime-slowpath-patch"
+            echo "warning=Empty CRC ko; load without CRC patch. Expect init@0x178 and __cfi_check landing pad. Init patches __cfi_slowpath_diag if present."
+            echo "cfi_check_patch=paciasp;autiasp;ret (required; bare RET reboots on this device)"
           } | tee "$GITHUB_WORKSPACE/out/ko/BUILD_INFO.txt"
           ls -la "$GITHUB_WORKSPACE/out/ko"
           python3 - <<'PY'

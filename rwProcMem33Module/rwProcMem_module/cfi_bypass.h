@@ -5,9 +5,12 @@
  * Runtime CFI bypass for GKI 5.10/5.15, adapted from lsnbm/Linux-android-arm64
  * (export_fun.h bypass_cfi by wangchuan2009).
  *
- * Old CFI uses a central slowpath checker. Patching it to RET makes all
- * CFI checks pass, which is required when OOT modules are not built with
- * the exact same CFI type hashes as the running OEM kernel.
+ * Two layers are required on this device (K60 Pro / 5.15.189):
+ *  1) Post-link patch of the *module* __cfi_check to a PAC landing pad
+ *     (paciasp; autiasp; ret) via scripts/patch_module_cfi_landing.py.
+ *     A bare RET here reboots during insmod before this init runs.
+ *  2) This runtime patch of the kernel __cfi_slowpath / __cfi_slowpath_diag
+ *     to RET so subsequent CFI type-hash mismatches accept (lsnbm-style).
  */
 #include <linux/kprobes.h>
 #include <linux/version.h>
