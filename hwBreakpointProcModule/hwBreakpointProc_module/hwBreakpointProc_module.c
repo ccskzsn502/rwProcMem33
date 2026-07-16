@@ -1,7 +1,9 @@
 #include "hwBreakpointProc_module.h"
 #include "proc_pid.h"
 #include "api_proxy.h"
+#ifdef CONFIG_ANTI_PTRACE_DETECTION_MODE
 #include "anti_ptrace_detection.h"
+#endif
 
 
 #pragma pack(push,1)
