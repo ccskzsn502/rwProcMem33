@@ -2515,7 +2515,7 @@ out:
 }
 #endif
 
-#if MY_LINUX_VERSION_CODE == KERNEL_VERSION(5,15,41)
+#if (MY_LINUX_VERSION_CODE >= KERNEL_VERSION(5,15,0) && MY_LINUX_VERSION_CODE < KERNEL_VERSION(6,0,0))
 
 /*
  * Indicate if the VMA is a stack for the given task; for
