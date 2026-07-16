@@ -25,4 +25,5 @@ adb shell su -c "dmesg | tail -50"
 ```
 
 ## Note
-CI builds OOT modules against Google `kernel/common` with CFI/LTO relaxed. Real device image uses CFI+LTO; if insmod fails, need exact matching symvers/CFI build.
+CI builds OOT modules against Google `kernel/common` with **CFI+LTO enabled** to match the K60 Pro GKI image.
+If `insmod` still fails with `disagrees about version of symbol module_layout`, the OEM `Module.symvers` CRC differs from Google common; need the exact device/GKI `Module.symvers` used for `ab14327796`.

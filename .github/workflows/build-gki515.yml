@@ -44,7 +44,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: kernel/common
-          key: gki-common-android13-5.15-742fd6fce289-modsym-v4
+          key: gki-common-android13-5.15-742fd6fce289-modsym-cfi-lto-v1
       - name: Fetch Google kernel/common GKI
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
@@ -80,25 +80,34 @@ jobs:
           scripts/config --enable CONFIG_HW_BREAKPOINT || true
           scripts/config --disable CONFIG_MODULE_SIG_FORCE || true
           scripts/config --disable CONFIG_TRIM_UNUSED_KSYMS || true
-          scripts/config --disable CONFIG_LTO_CLANG_FULL || true
-          scripts/config --disable CONFIG_LTO_CLANG_THIN || true
-          scripts/config --enable CONFIG_LTO_NONE || true
-          scripts/config --disable CONFIG_CFI_CLANG || true
-          scripts/config --disable CONFIG_CFI || true
-          make LLVM=1 ARCH=arm64 olddefconfig
-          make LLVM=1 ARCH=arm64 prepare modules_prepare -j"$(nproc)"
+                    # Match device: CONFIG_LTO_CLANG_FULL + CONFIG_CFI_CLANG.
+                    # Disabling CFI/LTO causes module_layout CRC mismatch (Exec format error).
+                    scripts/config --disable CONFIG_LTO_NONE || true
+                    scripts/config --enable CONFIG_LTO || true
+                    scripts/config --enable CONFIG_LTO_CLANG || true
+                    scripts/config --enable CONFIG_LTO_CLANG_FULL || true
+                    scripts/config --disable CONFIG_LTO_CLANG_THIN || true
+                    scripts/config --enable CONFIG_CFI_CLANG || true
+                    scripts/config --enable CONFIG_CFI_CLANG_SHADOW || true
+                    scripts/config --disable CONFIG_CFI_PERMISSIVE || true
+                    scripts/config --enable CONFIG_MODVERSIONS || true
+                    make LLVM=1 ARCH=arm64 olddefconfig
+                    grep -E 'CONFIG_LTO|CONFIG_CFI|CONFIG_MODVERSIONS' .config | head -n 40 || true
+                    make LLVM=1 ARCH=arm64 prepare modules_prepare -j"$(nproc)"
 
-          # Empty Module.symvers makes modpost report every symbol as undefined.
-          # Building in-tree modules generates a real Module.symvers export table.
-          if [ ! -s Module.symvers ]; then
-            echo "Building in-tree modules to generate Module.symvers (required for OOT .ko)..."
-            make LLVM=1 ARCH=arm64 modules -j"$(nproc)"
-          fi
+                    # Empty Module.symvers makes modpost report every symbol as undefined.
+                    # Building in-tree modules generates a real Module.symvers export table.
+                    if [ ! -s Module.symvers ]; then
+                      echo "Building in-tree modules to generate Module.symvers (required for OOT .ko)..."
+                      make LLVM=1 ARCH=arm64 modules -j"$(nproc)"
+                    fi
 
-          test -f include/generated/autoconf.h
-          test -s Module.symvers
-          wc -l Module.symvers
-          head -n 5 Module.symvers
+                    test -f include/generated/autoconf.h
+                    test -s Module.symvers
+                    wc -l Module.symvers
+                    head -n 5 Module.symvers
+                    # Capture module_layout CRC for debugging load failures.
+                    grep -E 'module_layout' Module.symvers | head -n 5 || true
       - name: Verify version macros 5.15.189
         run: |
           set -eux
@@ -135,8 +144,10 @@ jobs:
             echo "gki_commit_built=$(git -C kernel/common rev-parse HEAD)"
             echo "clang=$(clang --version | head -n1)"
             echo "module_symvers_lines=$(wc -l < kernel/common/Module.symvers)"
-            echo "warning=CI builds OOT modules with CFI/LTO disabled; device image may still mismatch"
-          } | tee out/ko/BUILD_INFO.txt
+                        echo "module_layout=$(grep -E 'module_layout' kernel/common/Module.symvers | head -n1 || true)"
+                        echo "cfi_lto=enabled"
+                        echo "warning=Built with CFI+LTO to match device; exact OEM Module.symvers may still differ"
+                      } | tee out/ko/BUILD_INFO.txt
           ls -la out/ko
       - uses: actions/upload-artifact@v4
         with:
