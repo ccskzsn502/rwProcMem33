@@ -497,6 +497,10 @@ static int hwBreakpointProc_release(struct inode *inode, struct file *filp) {
 }
 
 static int hwBreakpointProc_dev_init(void) {
+#ifdef CONFIG_SAFE_MINIMAL_INIT
+	printk(KERN_EMERG "hwbp: SAFE_MINIMAL_INIT hello %s\n", CONFIG_PROC_NODE_AUTH_KEY);
+	return 0;
+#else
 #ifdef CONFIG_KALLSYMS_LOOKUP_NAME
 	if (!init_kallsyms_lookup()) {
 		printk(KERN_EMERG "hwbp: init_kallsyms_lookup failed\n");
@@ -545,9 +549,14 @@ static int hwBreakpointProc_dev_init(void) {
 
 	printk(KERN_EMERG "Hello, %s\n", CONFIG_PROC_NODE_AUTH_KEY);
 	return 0;
+#endif
 }
 
 static void hwBreakpointProc_dev_exit(void) {
+#ifdef CONFIG_SAFE_MINIMAL_INIT
+	printk(KERN_EMERG "hwbp: SAFE_MINIMAL_INIT goodbye\n");
+	return;
+#else
 #ifdef CONFIG_ANTI_PTRACE_DETECTION_MODE
 	stop_anti_ptrace_detection();
 #endif
@@ -575,6 +584,7 @@ static void hwBreakpointProc_dev_exit(void) {
 		g_hwBreakpointProc_devp = NULL;
 	}
 	printk(KERN_EMERG "Goodbye\n");
+#endif
 }
 
 int __init init_module(void) {
@@ -601,7 +611,8 @@ unsigned char * __check_fail_(unsigned char *result)
 }
 #endif
 
-unsigned long __stack_chk_guard;
+/* Do not define a local canary; use kernel's __stack_chk_guard when present. */
+extern unsigned long __stack_chk_guard __attribute__((weak));
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Linux");

@@ -693,7 +693,8 @@ unsigned char * __check_fail_(unsigned char *result)
 }
 #endif
 
-unsigned long __stack_chk_guard;
+/* Do not define a local canary; use kernel's __stack_chk_guard when present. */
+extern unsigned long __stack_chk_guard __attribute__((weak));
 
 #ifdef CONFIG_MODULE_GUIDE_ENTRY
 module_init(hwBreakpointProc_dev_init);

@@ -16,6 +16,9 @@
 // kprobe 隐藏 /proc 目录在 CFI 内核上易触发崩溃，默认关闭
 // #define CONFIG_HIDE_PROCFS_DIR
 
+// 仅 printk 的最小 init，用于确认加载是否仍会重启（排查 CFI/ABI）
+#define CONFIG_SAFE_MINIMAL_INIT
+
 // 动态寻址模式
 #define CONFIG_KALLSYMS_LOOKUP_NAME
 
