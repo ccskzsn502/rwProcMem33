@@ -99,15 +99,17 @@ jobs:
           test -s Module.symvers
           wc -l Module.symvers
           head -n 5 Module.symvers
-      - name: Force version macros 5.15.189
+      - name: Verify version macros 5.15.189
         run: |
           set -eux
           for f in \
             driver/hwBreakpointProcModule/hwBreakpointProc_module/ver_control.h \
             driver/rwProcMem33Module/rwProcMem_module/ver_control.h
           do
-            sed -i 's/#define MY_LINUX_VERSION_CODE KERNEL_VERSION([^)]*)/#define MY_LINUX_VERSION_CODE KERNEL_VERSION(5,15,189)/' "$f"
-            grep 'MY_LINUX_VERSION_CODE KERNEL_VERSION(5,15,189)' "$f"
+            test -s "$f"
+            # Source already pins 5.15.189. Do not sed-rewrite: that also hits // comments
+            # and makes grep match commented lines, breaking set -e.
+            grep -E '^[[:space:]]*#define[[:space:]]+MY_LINUX_VERSION_CODE[[:space:]]+KERNEL_VERSION\(5,15,189\)' "$f"
           done
       - name: Build both .ko
         run: |
