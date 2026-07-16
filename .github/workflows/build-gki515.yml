@@ -44,7 +44,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: kernel/common
-          key: gki-common-android13-5.15-742fd6fce289-modsym-emptycrc-v1
+          key: gki-common-android13-5.15-742fd6fce289-modsym-emptycrc-cfi-v2
       - name: Fetch Google kernel/common GKI
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
@@ -80,8 +80,10 @@ jobs:
           scripts/config --enable CONFIG_HW_BREAKPOINT || true
           scripts/config --disable CONFIG_MODULE_SIG_FORCE || true
           scripts/config --disable CONFIG_TRIM_UNUSED_KSYMS || true
-          # Keep modules_prepare light (no full CFI/LTO vmlinux). Match lsnbm:
-          # build OOT with empty CRC (__versions without imported CRCs).
+          # Empty-CRC OOT (hide Module.symvers) like lsnbm. Keep CFI enabled in
+          # modules_prepare so struct module has init at +0x178 and OOT modules
+          # emit __cfi_check / .cfi_jt (required by loader on this GKI).
+          # Disable LTO only to keep modules_prepare light.
           scripts/config --enable CONFIG_KPROBES || true
           scripts/config --enable CONFIG_MODVERSIONS || true
           scripts/config --disable CONFIG_LTO_CLANG_FULL || true
@@ -89,9 +91,8 @@ jobs:
           scripts/config --disable CONFIG_LTO_CLANG_THIN || true
           scripts/config --disable CONFIG_LTO_CLANG || true
           scripts/config --disable CONFIG_LTO || true
-          # Module itself disables CFI sanitize; kernel CFI slowpath is
-          # patched at runtime (lsnbm-style).
-          scripts/config --disable CONFIG_CFI_CLANG || true
+          scripts/config --enable CONFIG_CFI_CLANG || true
+          scripts/config --enable CONFIG_CFI_CLANG_SHADOW || true
           make LLVM=1 ARCH=arm64 olddefconfig
           grep -E 'CONFIG_LTO|CONFIG_CFI|CONFIG_MODVERSIONS|CONFIG_KPROBES' .config | head -n 40 || true
           make LLVM=1 ARCH=arm64 prepare modules_prepare -j"$(nproc)"
@@ -157,17 +158,33 @@ jobs:
             echo "gki_commit_requested=${GKI_COMMIT}"
             echo "gki_commit_built=$(git -C "$GITHUB_WORKSPACE/kernel/common" rev-parse HEAD)"
             echo "clang=$(clang --version | head -n1)"
-            echo "build_style=lsnbm-empty-crc+runtime-cfi-bypass"
-            echo "warning=Empty CRC ko; load without CRC patch. Init patches __cfi_slowpath_diag if present."
+            echo "build_style=lsnbm-empty-crc+cfi-prepare+runtime-slowpath-patch"
+            echo "warning=Empty CRC ko; load without CRC patch. Expect init@0x178 and __cfi_check. Init patches __cfi_slowpath_diag if present."
           } | tee "$GITHUB_WORKSPACE/out/ko/BUILD_INFO.txt"
           ls -la "$GITHUB_WORKSPACE/out/ko"
           python3 - <<'PY'
           from pathlib import Path
-          import os
+          import os, struct
+          try:
+              from elftools.elf.elffile import ELFFile
+          except ImportError:
+              import subprocess, sys
+              subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pyelftools', '-q'])
+              from elftools.elf.elffile import ELFFile
           out = Path(os.environ['GITHUB_WORKSPACE']) / 'out' / 'ko'
           for p in sorted(out.glob('*.ko')):
               b = p.read_bytes()
               print(p.name, 'size', len(b), 'cfi_check', b.count(b'__cfi_check'), 'stack_chk_guard', b.count(b'__stack_chk_guard'))
+              with open(p, 'rb') as f:
+                  elf = ELFFile(f)
+                  rela = elf.get_section_by_name('.rela.gnu.linkonce.this_module')
+                  symtab = elf.get_section_by_name('.symtab')
+                  if rela and symtab:
+                      for r in rela.iter_relocations():
+                          name = symtab.get_symbol(r['r_info_sym']).name
+                          print('  this_module reloc', name, hex(r['r_offset']))
+                  has_cfi = any(s.name == '__cfi_check' for s in (symtab.iter_symbols() if symtab else []))
+                  print('  has_symbol___cfi_check', has_cfi)
           PY
       - uses: actions/upload-artifact@v4
         with:
