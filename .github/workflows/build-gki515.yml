@@ -44,7 +44,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: kernel/common
-          key: gki-common-android13-5.15-742fd6fce289-modsym-nocfi-nolto-v1
+          key: gki-common-android13-5.15-742fd6fce289-modsym-emptycrc-v1
       - name: Fetch Google kernel/common GKI
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
@@ -80,76 +80,95 @@ jobs:
           scripts/config --enable CONFIG_HW_BREAKPOINT || true
           scripts/config --disable CONFIG_MODULE_SIG_FORCE || true
           scripts/config --disable CONFIG_TRIM_UNUSED_KSYMS || true
-                    # Probe path: disable CFI/LTO first. Device reboots even on SAFE_MINIMAL_INIT
-                                                            # (printk-only) with CFI+THINLTO artifacts, so ABI mismatch is likely.
-                                                            # KernelPatch on device already logs "KP bypass_kcfi done", so non-CFI
-                                                            # OOT modules may still load after CRC patching.
-                                                            scripts/config --disable CONFIG_CFI_CLANG || true
-                                                            scripts/config --disable CONFIG_CFI_CLANG_SHADOW || true
-                                                            scripts/config --disable CONFIG_CFI_PERMISSIVE || true
-                                                            scripts/config --disable CONFIG_LTO_CLANG || true
-                                                            scripts/config --disable CONFIG_LTO_CLANG_THIN || true
-                                                            scripts/config --disable CONFIG_LTO_CLANG_FULL || true
-                                                            scripts/config --disable CONFIG_LTO || true
-                                                            scripts/config --enable CONFIG_LTO_NONE || true
+                    # Keep modules_prepare light (no full CFI/LTO vmlinux). Match lsnbm:
+                                                            # build OOT with empty CRC (__versions without imported CRCs).
+                                                            scripts/config --enable CONFIG_KPROBES || true
                                                             scripts/config --enable CONFIG_MODVERSIONS || true
+                                                            scripts/config --disable CONFIG_LTO_CLANG_FULL || true
+                                                            scripts/config --enable CONFIG_LTO_NONE || true
+                                                            scripts/config --disable CONFIG_LTO_CLANG_THIN || true
+                                                            scripts/config --disable CONFIG_LTO_CLANG || true
+                                                            scripts/config --disable CONFIG_LTO || true
+                                                            # Module itself disables CFI sanitize; kernel CFI slowpath is
+                                                            # patched at runtime (lsnbm-style).
+                                                            scripts/config --disable CONFIG_CFI_CLANG || true
                                                             make LLVM=1 ARCH=arm64 olddefconfig
-                                                            grep -E 'CONFIG_LTO|CONFIG_CFI|CONFIG_MODVERSIONS' .config | head -n 40 || true
+                                                            grep -E 'CONFIG_LTO|CONFIG_CFI|CONFIG_MODVERSIONS|CONFIG_KPROBES' .config | head -n 40 || true
                                                             make LLVM=1 ARCH=arm64 prepare modules_prepare -j"$(nproc)"
 
-                                                            # Empty Module.symvers makes modpost report every symbol as undefined.
+                                                            # modules_prepare alone may leave empty Module.symvers; generate one
+                                                            # then hide it during OOT build for empty-CRC ko (lsnbm NO_CRC).
                                                             if [ ! -s Module.symvers ]; then
-                                                              echo "Building in-tree modules to generate Module.symvers (required for OOT .ko)..."
+                                                              echo "Building in-tree modules to generate Module.symvers..."
                                                               make LLVM=1 ARCH=arm64 modules -j"$(nproc)" || \
                                                                 make LLVM=1 ARCH=arm64 modules -j2
                                                             fi
-
                                                             test -f include/generated/autoconf.h
-                                                            test -s Module.symvers
-                                                            wc -l Module.symvers
-                                                            head -n 5 Module.symvers
-                                                            grep -E 'module_layout' Module.symvers | head -n 5 || true
-      - name: Verify version macros 5.15.189
-        run: |
-          set -eux
-          for f in \
-            driver/hwBreakpointProcModule/hwBreakpointProc_module/ver_control.h \
-            driver/rwProcMem33Module/rwProcMem_module/ver_control.h
-          do
-            test -s "$f"
-            # Source already pins 5.15.189. Do not sed-rewrite: that also hits // comments
-            # and makes grep match commented lines, breaking set -e.
-            grep -E '^[[:space:]]*#define[[:space:]]+MY_LINUX_VERSION_CODE[[:space:]]+KERNEL_VERSION\(5,15,189\)' "$f"
-          done
-      - name: Build both .ko
-        run: |
-          set -eux
-          export PATH="/usr/lib/llvm-14/bin:$PATH"
-          KDIR="$GITHUB_WORKSPACE/kernel/common"
-          test -s "$KDIR/Module.symvers"
-          for MDIR in \
-            "$GITHUB_WORKSPACE/driver/hwBreakpointProcModule/hwBreakpointProc_module" \
-            "$GITHUB_WORKSPACE/driver/rwProcMem33Module/rwProcMem_module"
-          do
-            make -C "$KDIR" M="$MDIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-              CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
-              modules -j"$(nproc)"
-          done
-          mkdir -p out/ko
-          cp -v driver/hwBreakpointProcModule/hwBreakpointProc_module/*.ko out/ko/
-          cp -v driver/rwProcMem33Module/rwProcMem_module/*.ko out/ko/
-          {
-            echo "device=Redmi K60 Pro"
-            echo "uname=5.15.189-android13-8-00012-g742fd6fce289-ab14327796"
-            echo "gki_commit_requested=${GKI_COMMIT}"
-            echo "gki_commit_built=$(git -C kernel/common rev-parse HEAD)"
-            echo "clang=$(clang --version | head -n1)"
-            echo "module_symvers_lines=$(wc -l < kernel/common/Module.symvers)"
-                        echo "module_layout=$(grep -E 'module_layout' kernel/common/Module.symvers | head -n1 || true)"
-                                                echo "cfi_lto=none"
-                                                echo "warning=Probe build: CFI+LTO disabled; patch device CRCs before insmod"
-                      } | tee out/ko/BUILD_INFO.txt
-          ls -la out/ko
+                                                            # Ensure a non-empty symvers exists for prepare sanity, then backup.
+                                                            if [ -s Module.symvers ]; then
+                                                              cp -f Module.symvers Module.symvers.fullbak
+                                                              wc -l Module.symvers
+                                                              head -n 5 Module.symvers
+                                                              grep -E 'module_layout' Module.symvers | head -n 5 || true
+                                                            else
+                                                              echo "WARN: Module.symvers empty after prepare"
+                                                              : > Module.symvers.fullbak
+                                                            fi
+                          - name: Verify version macros 5.15.189
+                            run: |
+                              set -eux
+                              for f in \
+                                driver/hwBreakpointProcModule/hwBreakpointProc_module/ver_control.h \
+                                driver/rwProcMem33Module/rwProcMem_module/ver_control.h
+                              do
+                                test -s "$f"
+                                grep -E '^[[:space:]]*#define[[:space:]]+MY_LINUX_VERSION_CODE[[:space:]]+KERNEL_VERSION\(5,15,189\)' "$f"
+                              done
+                          - name: Build both .ko (empty CRC like lsnbm)
+                            run: |
+                              set -eux
+                              export PATH="/usr/lib/llvm-14/bin:$PATH"
+                              KDIR="$GITHUB_WORKSPACE/kernel/common"
+                              cd "$KDIR"
+                              # Hide Module.symvers so modpost cannot import symbol CRCs.
+                              # KBUILD_MODPOST_WARN=1 turns unresolved CRCs into warnings.
+                              if [ -f Module.symvers ]; then
+                                mv Module.symvers Module.symvers.no_crc_bak
+                              fi
+                              : > Module.symvers
+                              for MDIR in \
+                                "$GITHUB_WORKSPACE/driver/hwBreakpointProcModule/hwBreakpointProc_module" \
+                                "$GITHUB_WORKSPACE/driver/rwProcMem33Module/rwProcMem_module"
+                              do
+                                make -C "$KDIR" M="$MDIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+                                  CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
+                                  KBUILD_MODPOST_WARN=1 \
+                                  modules -j"$(nproc)"
+                              done
+                              if [ -f Module.symvers.no_crc_bak ]; then
+                                mv Module.symvers.no_crc_bak Module.symvers
+                              fi
+                              mkdir -p "$GITHUB_WORKSPACE/out/ko"
+                              cp -v "$GITHUB_WORKSPACE/driver/hwBreakpointProcModule/hwBreakpointProc_module/"*.ko "$GITHUB_WORKSPACE/out/ko/"
+                              cp -v "$GITHUB_WORKSPACE/driver/rwProcMem33Module/rwProcMem_module/"*.ko "$GITHUB_WORKSPACE/out/ko/"
+                              {
+                                echo "device=Redmi K60 Pro"
+                                echo "uname=5.15.189-android13-8-00012-g742fd6fce289-ab14327796"
+                                echo "gki_commit_requested=${GKI_COMMIT}"
+                                echo "gki_commit_built=$(git -C kernel/common rev-parse HEAD)"
+                                echo "clang=$(clang --version | head -n1)"
+                                echo "build_style=lsnbm-empty-crc+runtime-cfi-bypass"
+                                echo "warning=Empty CRC ko; load without CRC patch. Init patches __cfi_slowpath_diag if present."
+                              } | tee "$GITHUB_WORKSPACE/out/ko/BUILD_INFO.txt"
+                              ls -la "$GITHUB_WORKSPACE/out/ko"
+                                                            python3 - <<'PY'
+                              from pathlib import Path
+                              import os
+                              out = Path(os.environ['GITHUB_WORKSPACE']) / 'out' / 'ko'
+                              for p in sorted(out.glob('*.ko')):
+                                  b = p.read_bytes()
+                                  print(p.name, 'size', len(b), 'cfi_check', b.count(b'__cfi_check'), 'stack_chk_guard', b.count(b'__stack_chk_guard'))
+                              PY
       - uses: actions/upload-artifact@v4
         with:
           name: k60pro-gki515-ko

@@ -1,4 +1,5 @@
 ﻿#include "rwProcMem_module.h"
+#include "cfi_bypass.h"
 
 #define MY_TASK_COMM_LEN 16
 
@@ -329,8 +330,13 @@ static ssize_t rwProcMem_read(struct file* filp,
 }
 
 static int rwProcMem_dev_init(void) {
+	/* Match lsnbm: neutralize old CFI slowpath before any indirect kernel calls. */
+	if (!rw_bypass_cfi()) {
+		printk(KERN_EMERG "rwProcMem: CFI bypass failed\n");
+		/* Continue: KP may already bypass kCFI; still try to load. */
+	}
 #ifdef CONFIG_SAFE_MINIMAL_INIT
-	/* Probe-only init: no heap/proc/kprobe. Confirms module ABI/CFI load safety. */
+	/* Probe-only init after CFI bypass: no heap/proc. */
 	printk(KERN_EMERG "rwProcMem: SAFE_MINIMAL_INIT hello %s\n", CONFIG_PROC_NODE_AUTH_KEY);
 	return 0;
 #else
