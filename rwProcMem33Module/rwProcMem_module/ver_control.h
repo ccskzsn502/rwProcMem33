@@ -15,8 +15,8 @@
 // kprobe 隐藏 /proc 目录在 CFI 内核上易触发崩溃，默认关闭
 // #define CONFIG_HIDE_PROCFS_DIR
 
-// 仅 printk 的最小 init，用于确认加载是否仍会重启（排查 CFI/ABI）
-#define CONFIG_SAFE_MINIMAL_INIT
+// 仅 printk 的最小 init（排查 CFI/ABI）。empty-CRC 已稳定加载，恢复完整 proc init。
+// #define CONFIG_SAFE_MINIMAL_INIT
 
 #ifndef KERNEL_VERSION
 #define KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + (c))

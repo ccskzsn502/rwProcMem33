@@ -56,11 +56,12 @@ static bool rw_bypass_cfi(void)
 		return false;
 	}
 
-	cfi_addr = rw_kallsyms_lookup_name("__cfi_slowpath_diag"); /* 5.15 */
-	if (!cfi_addr)
+	/* Match lsnbm order: 5.10 slowpath first, then 5.15 diag. */
 		cfi_addr = rw_kallsyms_lookup_name("__cfi_slowpath"); /* 5.10 */
-	if (!cfi_addr)
-		cfi_addr = rw_kallsyms_lookup_name("_cfi_slowpath"); /* 5.4 */
+		if (!cfi_addr)
+			cfi_addr = rw_kallsyms_lookup_name("__cfi_slowpath_diag"); /* 5.15 */
+		if (!cfi_addr)
+			cfi_addr = rw_kallsyms_lookup_name("_cfi_slowpath"); /* 5.4 */
 
 	if (!cfi_addr) {
 		/* KP may already bypass kCFI; old slowpath may be absent. */
