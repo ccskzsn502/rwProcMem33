@@ -44,7 +44,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: kernel/common
-          key: gki-common-android13-5.15-742fd6fce289-modsym-cfi-thinlto-v2
+          key: gki-common-android13-5.15-742fd6fce289-modsym-nocfi-nolto-v1
       - name: Fetch Google kernel/common GKI
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
@@ -80,37 +80,35 @@ jobs:
           scripts/config --enable CONFIG_HW_BREAKPOINT || true
           scripts/config --disable CONFIG_MODULE_SIG_FORCE || true
           scripts/config --disable CONFIG_TRIM_UNUSED_KSYMS || true
-                    # Device uses CFI + LTO. FULL LTO of vmlinux.o is too heavy for GH runners
-                                        # (canceled at "LTO vmlinux.o"). Prefer THIN LTO which still
-                                        # exercises CFI/LTO ABI paths without full-program LTO link.
-                                        scripts/config --disable CONFIG_LTO_NONE || true
-                                        scripts/config --enable CONFIG_LTO || true
-                                        scripts/config --enable CONFIG_LTO_CLANG || true
-                                        scripts/config --disable CONFIG_LTO_CLANG_FULL || true
-                                        scripts/config --enable CONFIG_LTO_CLANG_THIN || true
-                                        scripts/config --enable CONFIG_CFI_CLANG || true
-                                        scripts/config --enable CONFIG_CFI_CLANG_SHADOW || true
-                                        scripts/config --disable CONFIG_CFI_PERMISSIVE || true
-                                        scripts/config --enable CONFIG_MODVERSIONS || true
-                                        make LLVM=1 ARCH=arm64 olddefconfig
-                                        grep -E 'CONFIG_LTO|CONFIG_CFI|CONFIG_MODVERSIONS' .config | head -n 40 || true
-                                        make LLVM=1 ARCH=arm64 prepare modules_prepare -j"$(nproc)"
+                    # Probe path: disable CFI/LTO first. Device reboots even on SAFE_MINIMAL_INIT
+                                                            # (printk-only) with CFI+THINLTO artifacts, so ABI mismatch is likely.
+                                                            # KernelPatch on device already logs "KP bypass_kcfi done", so non-CFI
+                                                            # OOT modules may still load after CRC patching.
+                                                            scripts/config --disable CONFIG_CFI_CLANG || true
+                                                            scripts/config --disable CONFIG_CFI_CLANG_SHADOW || true
+                                                            scripts/config --disable CONFIG_CFI_PERMISSIVE || true
+                                                            scripts/config --disable CONFIG_LTO_CLANG || true
+                                                            scripts/config --disable CONFIG_LTO_CLANG_THIN || true
+                                                            scripts/config --disable CONFIG_LTO_CLANG_FULL || true
+                                                            scripts/config --disable CONFIG_LTO || true
+                                                            scripts/config --enable CONFIG_LTO_NONE || true
+                                                            scripts/config --enable CONFIG_MODVERSIONS || true
+                                                            make LLVM=1 ARCH=arm64 olddefconfig
+                                                            grep -E 'CONFIG_LTO|CONFIG_CFI|CONFIG_MODVERSIONS' .config | head -n 40 || true
+                                                            make LLVM=1 ARCH=arm64 prepare modules_prepare -j"$(nproc)"
 
-                                        # Empty Module.symvers makes modpost report every symbol as undefined.
-                                        # Prefer building only modules (not a full LTO vmlinux) when possible.
-                                        if [ ! -s Module.symvers ]; then
-                                          echo "Building in-tree modules to generate Module.symvers (required for OOT .ko)..."
-                                          # Avoid linking vmlinux under LTO; modules target is enough for symvers.
-                                          make LLVM=1 ARCH=arm64 modules -j"$(nproc)" || \
-                                            make LLVM=1 ARCH=arm64 modules -j2
-                                        fi
+                                                            # Empty Module.symvers makes modpost report every symbol as undefined.
+                                                            if [ ! -s Module.symvers ]; then
+                                                              echo "Building in-tree modules to generate Module.symvers (required for OOT .ko)..."
+                                                              make LLVM=1 ARCH=arm64 modules -j"$(nproc)" || \
+                                                                make LLVM=1 ARCH=arm64 modules -j2
+                                                            fi
 
-                                        test -f include/generated/autoconf.h
-                                        test -s Module.symvers
-                                        wc -l Module.symvers
-                                        head -n 5 Module.symvers
-                                        # Capture module_layout CRC for debugging load failures.
-                                        grep -E 'module_layout' Module.symvers | head -n 5 || true
+                                                            test -f include/generated/autoconf.h
+                                                            test -s Module.symvers
+                                                            wc -l Module.symvers
+                                                            head -n 5 Module.symvers
+                                                            grep -E 'module_layout' Module.symvers | head -n 5 || true
       - name: Verify version macros 5.15.189
         run: |
           set -eux
@@ -148,8 +146,8 @@ jobs:
             echo "clang=$(clang --version | head -n1)"
             echo "module_symvers_lines=$(wc -l < kernel/common/Module.symvers)"
                         echo "module_layout=$(grep -E 'module_layout' kernel/common/Module.symvers | head -n1 || true)"
-                        echo "cfi_lto=thin"
-                                                echo "warning=Built with CFI+THIN LTO (full LTO too heavy on CI); patch device CRCs if insmod fails"
+                                                echo "cfi_lto=none"
+                                                echo "warning=Probe build: CFI+LTO disabled; patch device CRCs before insmod"
                       } | tee out/ko/BUILD_INFO.txt
           ls -la out/ko
       - uses: actions/upload-artifact@v4
