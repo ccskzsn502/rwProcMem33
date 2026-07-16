@@ -19,6 +19,7 @@
 // 仅 printk 的最小 init，用于确认加载是否仍会重启（排查 CFI/ABI）
 #define CONFIG_SAFE_MINIMAL_INIT
 
+#ifndef CONFIG_SAFE_MINIMAL_INIT
 // 动态寻址模式
 #define CONFIG_KALLSYMS_LOOKUP_NAME
 
@@ -27,6 +28,7 @@
 
 // 反PTRACE侦测模式
 #define CONFIG_ANTI_PTRACE_DETECTION_MODE
+#endif
 
 #ifndef KERNEL_VERSION
 #define KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + (c))
