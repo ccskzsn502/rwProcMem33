@@ -63,6 +63,8 @@ static const struct proc_ops hwBreakpointProc_proc_ops = {
 	.proc_release = hwBreakpointProc_release,
 };
 
+#define HWBP_MAX_STACK_FRAMES 16
+
 #pragma pack(1)
 struct my_user_pt_regs {
 	uint64_t regs[31];
@@ -72,11 +74,21 @@ struct my_user_pt_regs {
 	uint64_t orig_x0;
 	uint64_t syscallno;
 };
+/*
+ * CE-like hit payload:
+ * - hit_addr: X => PC; R/W/RW => data address (FAR preferred, else bp_addr)
+ * - regs_info.pc: always the accessor/instruction PC
+ * - stack_pcs: FP-chain snapshot, not full DWARF unwind
+ */
 struct HWBP_HIT_ITEM {
 	uint64_t task_id;
 	uint64_t hit_addr;
 	uint64_t hit_time;
 	struct my_user_pt_regs regs_info;
+	uint64_t bp_addr;
+	uint32_t hit_type;
+	uint32_t stack_count;
+	uint64_t stack_pcs[HWBP_MAX_STACK_FRAMES];
 };
 #pragma pack()
 

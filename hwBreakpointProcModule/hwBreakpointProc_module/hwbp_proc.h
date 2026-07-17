@@ -2,6 +2,8 @@
 #define _HWBP_PROC_H_
 #include "ver_control.h"
 
+#define HWBP_MAX_STACK_FRAMES 16
+
 #pragma pack(1)
 struct my_user_pt_regs {
 	uint64_t regs[31];
@@ -16,6 +18,10 @@ struct HWBP_HIT_ITEM {
 	uint64_t hit_addr;
 	uint64_t hit_time;
 	struct my_user_pt_regs regs_info;
+	uint64_t bp_addr;
+	uint32_t hit_type;
+	uint32_t stack_count;
+	uint64_t stack_pcs[HWBP_MAX_STACK_FRAMES];
 };
 #pragma pack()
 

@@ -59,25 +59,108 @@ static struct class *g_Class_devp;
 static struct mutex g_hwbp_handle_info_mutex;
 static cvector g_hwbp_handle_info_arr = NULL;
 
+static inline uint64_t read_far_el1(void)
+{
+	uint64_t far = 0;
+	asm volatile("mrs %0, far_el1" : "=r"(far));
+	return far;
+}
+
+static bool is_plausible_user_addr(uint64_t addr)
+{
+	if (addr < 0x1000ULL) {
+		return false;
+	}
+	if (addr >= 0x800000000000ULL) {
+		return false;
+	}
+	return true;
+}
+
+static uint32_t capture_user_callstack(struct pt_regs *regs, uint64_t *out, uint32_t max_frames)
+{
+	uint32_t n = 0;
+	uint64_t fp;
+	uint64_t prev_fp = 0;
+	int depth;
+
+	if (!regs || !out || max_frames == 0) {
+		return 0;
+	}
+
+	out[n++] = regs->pc;
+	if (n < max_frames && regs->regs[30] && regs->regs[30] != regs->pc) {
+		out[n++] = regs->regs[30];
+	}
+
+	fp = regs->regs[29];
+	for (depth = 0; n < max_frames && depth < (int)max_frames; ++depth) {
+		uint64_t frame[2];
+		if (!is_plausible_user_addr(fp) || (fp & 0x7ULL)) {
+			break;
+		}
+		if (prev_fp && fp <= prev_fp) {
+			break;
+		}
+		if (copy_from_user_nofault(frame, (const void __user *)fp, sizeof(frame))) {
+			break;
+		}
+		if (frame[1] && is_plausible_user_addr(frame[1])) {
+			if (n == 0 || out[n - 1] != frame[1]) {
+				out[n++] = frame[1];
+			}
+		}
+		prev_fp = fp;
+		if (!frame[0] || frame[0] == fp) {
+			break;
+		}
+		fp = frame[0];
+	}
+	return n;
+}
+
 static void record_hit_details(struct HWBP_HANDLE_INFO *info, struct pt_regs *regs) {
-    struct HWBP_HIT_ITEM hit_item = {0};
+	struct HWBP_HIT_ITEM hit_item = {0};
+	uint64_t far;
+	uint32_t bp_type;
+
 	if (!info || !regs) {
-        return;
-    }
+		return;
+	}
+
+	bp_type = info->original_attr.bp_type;
 	hit_item.task_id = info->task_id;
-    hit_item.hit_addr = regs->pc;
 	hit_item.hit_time = ktime_get_real_seconds();
-    memcpy(&hit_item.regs_info.regs, regs->regs, sizeof(hit_item.regs_info.regs));
-    hit_item.regs_info.sp = regs->sp;
-    hit_item.regs_info.pc = regs->pc;
-    hit_item.regs_info.pstate = regs->pstate;
-    hit_item.regs_info.orig_x0 = regs->orig_x0;
-    hit_item.regs_info.syscallno = regs->syscallno;
-    if (info->hit_item_arr) {
-		if(cvector_length(info->hit_item_arr) < MIN_LEN) { // 最多存放MIN_LEN个
+	hit_item.bp_addr = info->original_attr.bp_addr;
+	hit_item.hit_type = bp_type;
+
+	memcpy(&hit_item.regs_info.regs, regs->regs, sizeof(hit_item.regs_info.regs));
+	hit_item.regs_info.sp = regs->sp;
+	hit_item.regs_info.pc = regs->pc;
+	hit_item.regs_info.pstate = regs->pstate;
+	hit_item.regs_info.orig_x0 = regs->orig_x0;
+	hit_item.regs_info.syscallno = regs->syscallno;
+
+	if (bp_type & HW_BREAKPOINT_X) {
+		hit_item.hit_addr = regs->pc;
+	} else {
+		far = read_far_el1();
+		if (is_plausible_user_addr(far)) {
+			hit_item.hit_addr = far;
+		} else if (info->original_attr.bp_addr) {
+			hit_item.hit_addr = info->original_attr.bp_addr;
+		} else {
+			hit_item.hit_addr = regs->pc;
+		}
+	}
+
+	hit_item.stack_count = capture_user_callstack(regs, hit_item.stack_pcs, HWBP_MAX_STACK_FRAMES);
+
+	if (info->hit_item_arr) {
+		if (cvector_length(info->hit_item_arr) < MIN_LEN) {
 			cvector_pushback(info->hit_item_arr, &hit_item);
 		}
-    }
+	}
 }
 
 #ifdef CONFIG_MODIFY_HIT_NEXT_MODE
