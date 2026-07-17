@@ -93,6 +93,7 @@ static void hwbp_handler(struct perf_event *bp,
 	struct pt_regs *regs) {
 	citerator iter;
 	uint64_t hook_pc;
+	/* Exception/atomic context: never sleep, never call modify_user_hw_breakpoint. */
 	printk_debug(KERN_INFO "hw_breakpoint HIT!!!!! bp:%px, pc:%px, id:%d\n", bp, regs->pc, bp->id);
 
 	hook_pc = atomic64_read(&g_hook_pc);
@@ -101,37 +102,29 @@ static void hwbp_handler(struct perf_event *bp,
 		return;
 	}
 
-	mutex_lock(&g_hwbp_handle_info_mutex);
+	/* trylock: if install/uninstall holds the mutex, skip this sample instead of sleeping. */
+		if (!mutex_trylock(&g_hwbp_handle_info_mutex)) {
+			return;
+		}
 	for (iter = cvector_begin(g_hwbp_handle_info_arr); iter != cvector_end(g_hwbp_handle_info_arr); iter = cvector_next(g_hwbp_handle_info_arr, iter)) {
 		struct HWBP_HANDLE_INFO * hwbp_handle_info = (struct HWBP_HANDLE_INFO *)iter;
 		if (hwbp_handle_info->sample_hbp != bp) {
 			continue;
 		}
 #ifdef CONFIG_MODIFY_HIT_NEXT_MODE
-		if(hwbp_handle_info->next_instruction_attr.bp_addr != regs->pc) {
-			// first hit
-			bool should_toggle = true;
-			hwbp_hit_user_info_callback(bp, data, regs, hwbp_handle_info);
-			if(!hwbp_handle_info->is_32bit_task) {
-				if(arm64_move_bp_to_next_instruction(bp, regs->pc + 4, &hwbp_handle_info->original_attr, &hwbp_handle_info->next_instruction_attr)) {
-					should_toggle = false;
-				}
-			}
-			if(should_toggle) {
-				toggle_bp_registers_directly(&hwbp_handle_info->original_attr, hwbp_handle_info->is_32bit_task, 0);
-			}
-		} else {
-			// second hit
-			if(!arm64_recovery_bp_to_original(bp, &hwbp_handle_info->original_attr, &hwbp_handle_info->next_instruction_attr)) {
-				toggle_bp_registers_directly(&hwbp_handle_info->next_instruction_attr, hwbp_handle_info->is_32bit_task, 0);
-			}
-		}
+		/*
+		 * MODIFY_HIT_NEXT uses modify_user_hw_breakpoint (may sleep) and can
+		 * leave X-breakpoint residue that panics on unregister. Disabled by
+		 * default on GKI 5.15; keep compile path but only toggle+record.
+		 */
+		hwbp_hit_user_info_callback(bp, data, regs, hwbp_handle_info);
+		toggle_bp_registers_directly(&hwbp_handle_info->original_attr, hwbp_handle_info->is_32bit_task, 0);
 #else
 		hwbp_hit_user_info_callback(bp, data, regs, hwbp_handle_info);
 		toggle_bp_registers_directly(&hwbp_handle_info->original_attr, hwbp_handle_info->is_32bit_task, 0);
 #endif
 	}
-	
+
 	mutex_unlock(&g_hwbp_handle_info_mutex);
 }
 
@@ -233,6 +226,8 @@ static ssize_t OnCmdInstProcessHwbp(struct ioctl_request *hdr, char __user* buf)
 
 static ssize_t OnCmdUninstProcessHwbp(struct ioctl_request *hdr, char __user* buf) {
 	struct perf_event * sample_hbp = (struct perf_event *)hdr->param1;
+	struct perf_event_attr saved_attr;
+	bool is_32bit_task = false;
 	citerator iter;
 	bool found = false;
 	printk_debug(KERN_INFO "CMD_UNINST_PROCESS_HWBP\n");
@@ -241,14 +236,20 @@ static ssize_t OnCmdUninstProcessHwbp(struct ioctl_request *hdr, char __user* bu
 		return -EFAULT;
 	}
 
+	memset(&saved_attr, 0, sizeof(saved_attr));
 	mutex_lock(&g_hwbp_handle_info_mutex);
 	for (iter = cvector_begin(g_hwbp_handle_info_arr); iter != cvector_end(g_hwbp_handle_info_arr); iter = cvector_next(g_hwbp_handle_info_arr, iter)) {
 		struct HWBP_HANDLE_INFO * hwbp_handle_info = (struct HWBP_HANDLE_INFO *)iter;
 		if(hwbp_handle_info->sample_hbp == sample_hbp) {
+			/* Disable HW slot first so no further overflow fires during unregister. */
+			memcpy(&saved_attr, &hwbp_handle_info->original_attr, sizeof(saved_attr));
+			is_32bit_task = hwbp_handle_info->is_32bit_task;
+			toggle_bp_registers_directly(&saved_attr, is_32bit_task, 0);
 			if(hwbp_handle_info->hit_item_arr) {
 				cvector_destroy(hwbp_handle_info->hit_item_arr);
 				hwbp_handle_info->hit_item_arr = NULL;
 			}
+			hwbp_handle_info->sample_hbp = NULL;
 			cvector_rm(g_hwbp_handle_info_arr, iter);
 			found = true;
 			break;
@@ -258,7 +259,7 @@ static ssize_t OnCmdUninstProcessHwbp(struct ioctl_request *hdr, char __user* bu
 	if(found) {
 		x_unregister_hw_breakpoint(sample_hbp);
 	}
-	
+
 	return 0;
 }
 
@@ -492,10 +493,12 @@ static void clean_hwbp(void) {
 }
 
 static int hwBreakpointProc_release(struct inode *inode, struct file *filp) {
-	clean_hwbp();
-	mutex_lock(&g_hwbp_handle_info_mutex);
-	g_hwbp_handle_info_arr = cvector_create(sizeof(struct HWBP_HANDLE_INFO));
-	mutex_unlock(&g_hwbp_handle_info_mutex);
+	/*
+	 * Do NOT unregister all breakpoints on every fd close.
+	 * testHwBp keeps one fd for the whole run; destructor/close would race
+	 * with Uninst and leave bad debug-register state. Cleanup is explicit
+	 * via Uninst / module_exit only.
+	 */
 	return 0;
 }
 

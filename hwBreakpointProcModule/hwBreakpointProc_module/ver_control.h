@@ -23,11 +23,12 @@
 // 动态寻址模式
 #define CONFIG_KALLSYMS_LOOKUP_NAME
 
-// 精准命中记录模式
-#define CONFIG_MODIFY_HIT_NEXT_MODE
+// 精准命中记录：会把数据写断点临时改成 X 断点（pc+4）。
+// 在 GKI 5.15 + CFI 上，该路径命中后卸载/release 易延迟重启，先关闭。
+// #define CONFIG_MODIFY_HIT_NEXT_MODE
 
-// 反PTRACE侦测模式
-#define CONFIG_ANTI_PTRACE_DETECTION_MODE
+// 反PTRACE：kretprobe hook arch_ptrace，CFI 内核上同样偏险，先关闭。
+// #define CONFIG_ANTI_PTRACE_DETECTION_MODE
 #endif
 
 #ifndef KERNEL_VERSION
