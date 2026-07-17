@@ -14,9 +14,8 @@
 static unsigned long (*kallsyms_lookup_name_sym)(const char *name);
 static struct perf_event* (*register_user_hw_breakpoint_sym)(struct perf_event_attr *attr, perf_overflow_handler_t triggered, void *context, struct task_struct *tsk);
 static void (*unregister_hw_breakpoint_sym)(struct perf_event *bp);
-#ifdef CONFIG_MODIFY_HIT_NEXT_MODE
+/* Needed by Suspend/Resume even when MODIFY_HIT_NEXT is off. */
 static int (*modify_user_hw_breakpoint_sym)(struct perf_event *bp, struct perf_event_attr *attr);
-#endif
 
 static int _kallsyms_lookup_kprobe(struct kprobe *p, struct pt_regs *regs) { return 0; }
 static unsigned long get_kallsyms_func(void) {
@@ -50,15 +49,13 @@ static bool init_kallsyms_lookup(void) {
 	if(!register_user_hw_breakpoint_sym) { return false; }
 
 	unregister_hw_breakpoint_sym = (void *)generic_kallsyms_lookup_name("unregister_hw_breakpoint");
-	printk_debug(KERN_EMERG "unregister_hw_breakpoint_sym:%px\n", unregister_hw_breakpoint_sym);
-	if(!unregister_hw_breakpoint_sym) { return false; }
+		printk_debug(KERN_EMERG "unregister_hw_breakpoint_sym:%px\n", unregister_hw_breakpoint_sym);
+		if(!unregister_hw_breakpoint_sym) { return false; }
 
-#ifdef CONFIG_MODIFY_HIT_NEXT_MODE
-	modify_user_hw_breakpoint_sym = (void *)generic_kallsyms_lookup_name("modify_user_hw_breakpoint");
-	printk_debug(KERN_EMERG "modify_user_hw_breakpoint_sym:%px\n", modify_user_hw_breakpoint_sym);
-	if(!modify_user_hw_breakpoint_sym) { return false; }
-#endif
+		modify_user_hw_breakpoint_sym = (void *)generic_kallsyms_lookup_name("modify_user_hw_breakpoint");
+		printk_debug(KERN_EMERG "modify_user_hw_breakpoint_sym:%px\n", modify_user_hw_breakpoint_sym);
+		if(!modify_user_hw_breakpoint_sym) { return false; }
 
-	return true;
-}
+		return true;
+	}
 #endif
