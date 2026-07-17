@@ -1,6 +1,7 @@
 #include "hwBreakpointProc_module.h"
 #include "proc_pid.h"
 #include "api_proxy.h"
+#include "cfi_bypass.h"
 #ifdef CONFIG_ANTI_PTRACE_DETECTION_MODE
 #include "anti_ptrace_detection.h"
 #endif
@@ -503,6 +504,12 @@ static int hwBreakpointProc_dev_init(void) {
 	printk(KERN_EMERG "hwbp: SAFE_MINIMAL_INIT hello %s\n", CONFIG_PROC_NODE_AUTH_KEY);
 	return 0;
 #else
+	/* PAC landing on module __cfi_check is required to enter init; then patch
+	 * kernel slowpath so later CFI type-hash mismatches accept (lsnbm-style). */
+	if (!rw_bypass_cfi()) {
+		printk(KERN_EMERG "hwbp: CFI bypass failed\n");
+		return -EFAULT;
+	}
 #ifdef CONFIG_KALLSYMS_LOOKUP_NAME
 	if (!init_kallsyms_lookup()) {
 		printk(KERN_EMERG "hwbp: init_kallsyms_lookup failed\n");
