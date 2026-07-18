@@ -87,10 +87,15 @@ static const struct proc_ops merged_proc_ops = {
  *   paciasp; autiasp; ret
  * Current -fno-sanitize=cfi residual was only 8B: paciasp; brk → hard reboot.
  * Provide a real landing in source so compile→insmod needs no Python.
+ *
+ * Match include/linux/cfi.h prototype (uint64_t id, ...).
+ * Do not nest noinline inside __attribute__: kernel noinline macro expands
+ * to __attribute__((__noinline__)) and breaks nested attributes.
  */
-__attribute__((naked, used, noinline, no_sanitize("cfi")))
-void __cfi_check(unsigned long ignored, void *target_addr, void *diag)
+__attribute__((naked, used, no_sanitize("cfi")))
+void __cfi_check(uint64_t id, void *ptr, void *diag)
 {
+	/* args unused: accept-all landing pad */
 	asm volatile(
 		"paciasp\n"
 		"autiasp\n"
@@ -98,7 +103,7 @@ void __cfi_check(unsigned long ignored, void *target_addr, void *diag)
 	);
 }
 
-__attribute__((used, noinline, no_sanitize("cfi")))
+__attribute__((used, no_sanitize("cfi")))
 void __cfi_check_fail(void *data)
 {
 	/* accept-all: never panic from module CFI fail path */
