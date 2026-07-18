@@ -1,14 +1,19 @@
-name: Build GKI 5.15 Modules (K60 Pro)
+name: Build GKI merged_module.ko
+
 on:
   workflow_dispatch:
   push:
     branches: [master, main]
+
 permissions:
   contents: read
+
 env:
+  # Google kernel/common GKI; not OEM. API uses LINUX_VERSION_CODE from tree.
   GKI_BRANCH: android13-5.15
   GKI_COMMIT: 742fd6fce289
   ARCH: arm64
+
 jobs:
   build-ko:
     runs-on: ubuntu-22.04
@@ -17,6 +22,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: driver
+
       - name: Install deps and Clang 14
         run: |
           set -eux
@@ -37,14 +43,15 @@ jobs:
             export PATH="/usr/lib/llvm-14/bin:$PATH"
           fi
           clang --version
-          command -v llvm-objdump
           ld.lld --version
+
       - name: Cache GKI sources
         id: cache-kernel
         uses: actions/cache@v4
         with:
           path: kernel/common
           key: gki-common-android13-5.15-742fd6fce289-modsym-emptycrc-cfithinlto-v3
+
       - name: Fetch Google kernel/common GKI
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
@@ -60,7 +67,8 @@ jobs:
             git checkout --force FETCH_HEAD
           fi
           git log -1 --oneline
-      - name: Configure and generate real Module.symvers
+
+      - name: Configure and modules_prepare
         run: |
           set -eux
           export PATH="/usr/lib/llvm-14/bin:$PATH"
@@ -80,10 +88,6 @@ jobs:
           scripts/config --enable CONFIG_HW_BREAKPOINT || true
           scripts/config --disable CONFIG_MODULE_SIG_FORCE || true
           scripts/config --disable CONFIG_TRIM_UNUSED_KSYMS || true
-          # Empty-CRC OOT (hide Module.symvers) like lsnbm.
-          # On GKI 5.15, CONFIG_CFI_CLANG depends on LTO_CLANG. Without CFI:
-          #  - struct module init lands at +0x170 (device expects +0x178)
-          #  - OOT ko lacks __cfi_check / JT → loader CFI-call of init reboots
           scripts/config --enable CONFIG_KPROBES || true
           scripts/config --enable CONFIG_MODVERSIONS || true
           scripts/config --disable CONFIG_LTO_NONE || true
@@ -95,139 +99,67 @@ jobs:
           scripts/config --enable CONFIG_CFI_CLANG_SHADOW || true
           make LLVM=1 ARCH=arm64 olddefconfig
           grep -E 'CONFIG_LTO|CONFIG_CFI|CONFIG_MODVERSIONS|CONFIG_KPROBES' .config | head -n 40 || true
-          # Fail fast if CFI did not stick (usually LTO dependency).
           grep -q '^CONFIG_CFI_CLANG=y' .config
-          grep -qE '^CONFIG_LTO_CLANG(_THIN)?=y|^CONFIG_LTO_CLANG=y' .config || grep -q '^CONFIG_LTO_CLANG_THIN=y' .config
           make LLVM=1 ARCH=arm64 prepare modules_prepare -j"$(nproc)"
-
-          # modules_prepare alone may leave empty Module.symvers; generate one
-          # then hide it during OOT build for empty-CRC ko (lsnbm NO_CRC).
           if [ ! -s Module.symvers ]; then
             echo "Building in-tree modules to generate Module.symvers..."
             make LLVM=1 ARCH=arm64 modules -j"$(nproc)" || \
               make LLVM=1 ARCH=arm64 modules -j2
           fi
           test -f include/generated/autoconf.h
-          # Ensure a non-empty symvers exists for prepare sanity, then backup.
           if [ -s Module.symvers ]; then
             cp -f Module.symvers Module.symvers.fullbak
             wc -l Module.symvers
-            head -n 5 Module.symvers
-            grep -E 'module_layout' Module.symvers | head -n 5 || true
           else
-            echo "WARN: Module.symvers empty after prepare"
             : > Module.symvers.fullbak
           fi
-      - name: Verify version macros 5.15.189
-        run: |
-          set -eux
-          for f in \
-            driver/hwBreakpointProcModule/hwBreakpointProc_module/ver_control.h \
-            driver/rwProcMem33Module/rwProcMem_module/ver_control.h
-          do
-            test -s "$f"
-            grep -E '^[[:space:]]*#define[[:space:]]+MY_LINUX_VERSION_CODE[[:space:]]+KERNEL_VERSION\(5,15,189\)' "$f"
-          done
-      - name: Build both .ko (empty CRC like lsnbm)
+          # Report tree version (source follows LINUX_VERSION_CODE, no pin)
+          grep -E 'LINUX_VERSION|UTS_RELEASE|SUBLEVEL' include/generated/uapi/linux/version.h include/config/kernel.release 2>/dev/null || true
+          cat include/config/kernel.release || true
+
+      - name: Build merged_module.ko (lsnbm empty-CRC, no py)
         run: |
           set -eux
           export PATH="/usr/lib/llvm-14/bin:$PATH"
           KDIR="$GITHUB_WORKSPACE/kernel/common"
+          MDIR="$GITHUB_WORKSPACE/driver/kernel"
+          test -f "$MDIR/Makefile"
           cd "$KDIR"
-          # Hide Module.symvers so modpost cannot import symbol CRCs.
-          # KBUILD_MODPOST_WARN=1 turns unresolved CRCs into warnings.
+          # Hide Module.symvers so modpost cannot import symbol CRCs (lsnbm NO_CRC).
           if [ -f Module.symvers ]; then
             mv Module.symvers Module.symvers.no_crc_bak
           fi
           : > Module.symvers
-          for MDIR in \
-            "$GITHUB_WORKSPACE/driver/hwBreakpointProcModule/hwBreakpointProc_module" \
-            "$GITHUB_WORKSPACE/driver/rwProcMem33Module/rwProcMem_module"
-          do
-            make -C "$KDIR" M="$MDIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-              CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
-              KBUILD_MODPOST_WARN=1 \
-              modules -j"$(nproc)"
-          done
+          make -C "$KDIR" M="$MDIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
+            KBUILD_MODPOST_WARN=1 \
+            modules -j"$(nproc)"
           if [ -f Module.symvers.no_crc_bak ]; then
             mv Module.symvers.no_crc_bak Module.symvers
           fi
           mkdir -p "$GITHUB_WORKSPACE/out/ko"
-          cp -v "$GITHUB_WORKSPACE/driver/hwBreakpointProcModule/hwBreakpointProc_module/"*.ko "$GITHUB_WORKSPACE/out/ko/"
-          cp -v "$GITHUB_WORKSPACE/driver/rwProcMem33Module/rwProcMem_module/"*.ko "$GITHUB_WORKSPACE/out/ko/"
-          # Device-proven: bare RET in __cfi_check reboots; PAC landing pad works.
-          # Patch module __cfi_check/__cfi_check_fail to: paciasp; autiasp; ret
-          python3 "$GITHUB_WORKSPACE/driver/scripts/patch_module_cfi_landing.py" --in-place \
-            "$GITHUB_WORKSPACE/out/ko/"*.ko
+          cp -v "$MDIR"/merged_module.ko "$GITHUB_WORKSPACE/out/ko/"
           {
-            echo "device=Redmi K60 Pro"
-            echo "uname=5.15.189-android13-8-00012-g742fd6fce289-ab14327796"
+            echo "device=Redmi K60 Pro (target)"
+            echo "uname_hint=5.15.189-android13-8-00012-g742fd6fce289-ab14327796"
+            echo "gki_repo=https://android.googlesource.com/kernel/common"
+            echo "gki_branch=${GKI_BRANCH}"
             echo "gki_commit_requested=${GKI_COMMIT}"
-            echo "gki_commit_built=$(git -C "$GITHUB_WORKSPACE/kernel/common" rev-parse HEAD)"
+            echo "gki_commit_built=$(git -C "$KDIR" rev-parse HEAD)"
+            echo "kernel_release=$(cat "$KDIR/include/config/kernel.release" 2>/dev/null || true)"
             echo "clang=$(clang --version | head -n1)"
-            echo "build_style=lsnbm-empty-crc+cfi-prepare+pac-landing-cfi-check+runtime-slowpath-patch"
-            echo "warning=Empty CRC ko; load without CRC patch. Expect init@0x178 and __cfi_check landing pad. Init patches __cfi_slowpath_diag if present."
-            echo "cfi_check_patch=paciasp;autiasp;ret (required; bare RET reboots on this device)"
+            echo "module=merged_module.ko"
+            echo "layout=kernel/ single-node R/W+search+HWBP"
+            echo "build_style=lsnbm-empty-crc+fno-sanitize=cfi+runtime-slowpath"
+            echo "post_link_py=none"
+            echo "load=insmod merged_module.ko (root); init patches __cfi_slowpath"
           } | tee "$GITHUB_WORKSPACE/out/ko/BUILD_INFO.txt"
           ls -la "$GITHUB_WORKSPACE/out/ko"
-          python3 - <<'PY'
-          from pathlib import Path
-          import os, struct, subprocess
-          out = Path(os.environ['GITHUB_WORKSPACE']) / 'out' / 'ko'
-          for p in sorted(out.glob('*.ko')):
-              b = p.read_bytes()
-              print(p.name, 'size', len(b),
-                    'cfi_check_str', b.count(b'__cfi_check'),
-                    'cfi_jt_str', b.count(b'.cfi_jt') + b.count(b'__cfi_jt'),
-                    'stack_chk_guard', b.count(b'__stack_chk_guard'))
-              # Prefer llvm-readelf for init reloc offset (no pip deps).
-              try:
-                  r = subprocess.check_output(['llvm-readelf', '-r', str(p)], text=True, errors='replace')
-                  for line in r.splitlines():
-                      if 'this_module' in line or 'init_module' in line or 'cleanup_module' in line:
-                          print(' ', line.strip())
-              except Exception as e:
-                  print('  readelf note:', e)
-              try:
-                  s = subprocess.check_output(['llvm-nm', str(p)], text=True, errors='replace')
-                  for line in s.splitlines():
-                      if '__cfi_check' in line or 'init_module' in line or 'cleanup_module' in line:
-                          print('  nm', line.strip())
-              except Exception as e:
-                  print('  nm note:', e)
-          PY
+          llvm-nm "$GITHUB_WORKSPACE/out/ko/merged_module.ko" | grep -E 'init_module|cleanup_module|__cfi' || true
+          llvm-readelf -n "$GITHUB_WORKSPACE/out/ko/merged_module.ko" 2>/dev/null | head -n 20 || true
+
       - uses: actions/upload-artifact@v4
         with:
-          name: k60pro-gki515-ko
+          name: merged-module-gki515
           path: out/ko/
           if-no-files-found: error
-  build-userspace:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      - uses: nttld/setup-ndk@v1
-        id: ndk
-        with:
-          ndk-version: r26d
-          add-to-path: true
-      - name: Fix Windows include path if present
-        run: |
-          set -eux
-          find hwBreakpointProcModule -name 'HwBreakpointMgr4.h' -print0 | xargs -0 sed -i 's#linux\\perf_event.h#linux/perf_event.h#g'
-      - name: ndk-build demos
-        env:
-          NDK: ${{ steps.ndk.outputs.ndk-path }}
-        run: |
-          set -eux
-          "$NDK/ndk-build" -C hwBreakpointProcModule/testHwBp -j"$(nproc)"
-          "$NDK/ndk-build" -C hwBreakpointProcModule/testHwBpServer -j"$(nproc)" || true
-          "$NDK/ndk-build" -C rwProcMem33Module/testKo -j"$(nproc)" || true
-          mkdir -p out/userspace
-          find . -type f -path '*/libs/arm64-v8a/*' -exec cp -v {} out/userspace/ \;
-          ls -la out/userspace
-      - uses: actions/upload-artifact@v4
-        with:
-          name: k60pro-userspace-arm64
-          path: out/userspace/
-          if-no-files-found: warn
