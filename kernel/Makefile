@@ -1,7 +1,9 @@
 # Single .ko: R/W + kernel search + HWBP, one /proc auth node.
 # CMDs: RW 1..14, HWBP 100..111
 #
-# lsnbm-style load (no post-link py): empty-CRC + runtime CFI slowpath.
+# Load path (no post-link py):
+#   empty-CRC + runtime CFI slowpath + source __cfi_check PAC landing
+#   (paciasp;autiasp;ret in merged_main.c — same pad dual modules needed)
 # Build against any prepared GKI tree (no version pin in source).
 # API branches use LINUX_VERSION_CODE from that tree.
 # Example (modules_prepare outdir = $OUT):

@@ -81,6 +81,30 @@ static const struct proc_ops merged_proc_ops = {
 	.proc_release = merged_release,
 };
 
+/*
+ * GKI CFI may call module __cfi_check before init runs.
+ * Historical stable dual modules used post-link pad:
+ *   paciasp; autiasp; ret
+ * Current -fno-sanitize=cfi residual was only 8B: paciasp; brk → hard reboot.
+ * Provide a real landing in source so compile→insmod needs no Python.
+ */
+__attribute__((naked, used, noinline, no_sanitize("cfi")))
+void __cfi_check(unsigned long ignored, void *target_addr, void *diag)
+{
+	asm volatile(
+		"paciasp\n"
+		"autiasp\n"
+		"ret\n"
+	);
+}
+
+__attribute__((used, noinline, no_sanitize("cfi")))
+void __cfi_check_fail(void *data)
+{
+	/* accept-all: never panic from module CFI fail path */
+	(void)data;
+}
+
 static int __init merged_init(void)
 {
 	int ret;
