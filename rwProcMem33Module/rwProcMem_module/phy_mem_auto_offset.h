@@ -125,7 +125,7 @@ static inline pgd_t *x_pgd_offset(struct mm_struct *mm, size_t addr) {
 		}
 	}
 	accurate_offset = (ssize_t)((size_t)&mm->pgd - (size_t)mm + g_pgd_offset_mm_struct);
-	printk_debug(KERN_INFO "x_pgd_offset accurate_offset:%zd\n", accurate_offset);
+	/* Do not printk here: search/read hot path calls this per page */
 	if (accurate_offset >= sizeof(struct mm_struct) - sizeof(ssize_t)) {
 		return NULL;
 	}

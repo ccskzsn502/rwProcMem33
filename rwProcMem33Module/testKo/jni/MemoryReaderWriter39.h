@@ -31,6 +31,23 @@
 
 class CMemoryReaderWriter : public IMemReaderWriterProxy {
 public:
+	enum {
+		SEARCH_VAL_U8 = 1,
+		SEARCH_VAL_U16 = 2,
+		SEARCH_VAL_U32 = 4,
+		SEARCH_VAL_U64 = 8,
+		SEARCH_VAL_FLOAT = 0x14,
+		SEARCH_VAL_DOUBLE = 0x18,
+		SEARCH_VAL_BYTES = 0x20,
+		SEARCH_PROT_R = 1,
+		SEARCH_PROT_W = 2,
+		SEARCH_PROT_X = 4,
+		SEARCH_PROT_ANY = 0x7,
+		SEARCH_FLAG_FORCE_READ = 1,
+		SEARCH_FLAG_HAS_MASK = 2,
+	};
+	static constexpr uint64_t SEARCH_TRUNCATED_BIT = (1ull << 63);
+
 	CMemoryReaderWriter() {}
 	~CMemoryReaderWriter() { DisconnectDriver(); }
 
@@ -153,6 +170,29 @@ public:
 	// 返回值：TRUE成功，FALSE失败
 	BOOL HideKernelModule() {
 		return _InternalHideKernelModule();
+	}
+
+	// 驱动_内核内搜索进程内存（只回传命中地址，避免用户态大缓冲闪退）
+	// valueType: 1/2/4/8 或 0x14=float 0x18=double 0x20=bytes
+	// mask 可选，长度与 value 相同，0x00=通配 0xff=精确
+	// 返回值：TRUE成功；outAddrs 为命中地址；outTruncated 是否达上限截断
+	BOOL SearchProcessMemory(
+		uint64_t hProcess,
+		uint64_t startAddr,
+		uint64_t endAddr,
+		uint32_t valueType,
+		const void* value,
+		uint32_t valueSize,
+		const void* mask,
+		uint32_t alignment,
+		uint32_t maxResults,
+		uint32_t protMask,
+		BOOL forceRead,
+		std::vector<uint64_t>& outAddrs,
+		BOOL* outTruncated = NULL) {
+		return _InternalSearchProcessMemory(
+			hProcess, startAddr, endAddr, valueType, value, valueSize, mask,
+			alignment, maxResults, protMask, forceRead, outAddrs, outTruncated);
 	}
 
 	// 驱动_获取连接FD
@@ -315,6 +355,32 @@ private:
 #endif
 	}
 
+	BOOL _InternalSearchProcessMemory(
+		uint64_t hProcess,
+		uint64_t startAddr,
+		uint64_t endAddr,
+		uint32_t valueType,
+		const void* value,
+		uint32_t valueSize,
+		const void* mask,
+		uint32_t alignment,
+		uint32_t maxResults,
+		uint32_t protMask,
+		BOOL forceRead,
+		std::vector<uint64_t>& outAddrs,
+		BOOL* outTruncated) {
+#ifdef __linux__
+		return _rwProcMemDriver_SearchProcessMemory(
+			m_nFd, hProcess, startAddr, endAddr, valueType, value, valueSize, mask,
+			alignment, maxResults, protMask, forceRead, outAddrs, outTruncated);
+#else
+		(void)hProcess; (void)startAddr; (void)endAddr; (void)valueType;
+		(void)value; (void)valueSize; (void)mask; (void)alignment;
+		(void)maxResults; (void)protMask; (void)forceRead; (void)outAddrs; (void)outTruncated;
+		return FALSE;
+#endif
+	}
+
 	int _InternalGetLinkFD() {
 #ifdef __linux__
 		return m_nFd;
@@ -352,7 +418,21 @@ private:
 		CMD_GET_PROCESS_RSS,			// 获取进程的物理内存占用大小
 		CMD_GET_PROCESS_CMDLINE_ADDR,	// 获取进程cmdline的内存地址
 		CMD_HIDE_KERNEL_MODULE,			// 隐藏驱动
+		CMD_SEARCH_PROCESS_MEMORY,		// 内核内搜索进程内存
 	};
+
+	#pragma pack(push,1)
+	struct search_request {
+		uint64_t start_addr = 0;
+		uint64_t end_addr = 0;
+		uint32_t value_type = 0;
+		uint32_t value_size = 0;
+		uint32_t alignment = 0;
+		uint32_t max_results = 0;
+		uint32_t prot_mask = 0;
+		uint32_t flags = 0;
+	};
+	#pragma pack(pop)
 
 	#pragma pack(push,1)
 	struct IoctlRequest {
@@ -700,6 +780,92 @@ private:
 		}
 		memset(lpOutCmdlineBuf, 0, bufSize);
 		return _rwProcMemDriver_ReadProcessMemory(nFd, hProcess, aginfo.arg_start, lpOutCmdlineBuf, len, NULL, FALSE);
+	}
+
+	BOOL _rwProcMemDriver_SearchProcessMemory(
+		int nFd,
+		uint64_t hProcess,
+		uint64_t startAddr,
+		uint64_t endAddr,
+		uint32_t valueType,
+		const void* value,
+		uint32_t valueSize,
+		const void* mask,
+		uint32_t alignment,
+		uint32_t maxResults,
+		uint32_t protMask,
+		BOOL forceRead,
+		std::vector<uint64_t>& outAddrs,
+		BOOL* outTruncated) {
+		if (nFd < 0 || !hProcess || !value || valueSize == 0 || valueSize > 64) {
+			return FALSE;
+		}
+		outAddrs.clear();
+		if (outTruncated) {
+			*outTruncated = FALSE;
+		}
+
+		uint32_t maxHits = maxResults ? maxResults : 4096;
+		if (maxHits > 65536) {
+			maxHits = 65536;
+		}
+
+		const bool hasMask = (mask != NULL);
+		const size_t needIn = sizeof(search_request) + valueSize + (hasMask ? valueSize : 0);
+		const size_t needOut = sizeof(uint64_t) + (size_t)maxHits * sizeof(uint64_t);
+		const size_t bufLen = (needIn > needOut) ? needIn : needOut;
+
+		static thread_local IoctlBufferPool pool;
+		char* buf = pool.getBuffer(bufLen);
+		if (!buf) {
+			return FALSE;
+		}
+		memset(buf, 0, bufLen);
+
+		search_request req = {};
+		req.start_addr = startAddr;
+		req.end_addr = endAddr;
+		req.value_type = valueType;
+		req.value_size = valueSize;
+		req.alignment = alignment;
+		req.max_results = maxHits;
+		req.prot_mask = protMask;
+		req.flags = 0;
+		if (forceRead) {
+			req.flags |= SEARCH_FLAG_FORCE_READ;
+		}
+		if (hasMask) {
+			req.flags |= SEARCH_FLAG_HAS_MASK;
+		}
+
+		memcpy(buf, &req, sizeof(req));
+		memcpy(buf + sizeof(req), value, valueSize);
+		if (hasMask) {
+			memcpy(buf + sizeof(req) + valueSize, mask, valueSize);
+		}
+
+		ssize_t res = _rwProcMemDriver_MyIoctl(
+			nFd, CMD_SEARCH_PROCESS_MEMORY, hProcess, 0, 0, buf, bufLen);
+		if (res != 0) {
+			TRACE("SearchProcessMemory ioctl():%s\n", strerror(errno));
+			return FALSE;
+		}
+
+		uint64_t meta = 0;
+		memcpy(&meta, buf, sizeof(meta));
+		const bool truncated = (meta & SEARCH_TRUNCATED_BIT) != 0;
+		const uint64_t hitCount = meta & ~SEARCH_TRUNCATED_BIT;
+		if (outTruncated) {
+			*outTruncated = truncated ? TRUE : FALSE;
+		}
+		if (hitCount > maxHits) {
+			return FALSE;
+		}
+		if (hitCount > 0) {
+			const uint64_t* addrs = reinterpret_cast<const uint64_t*>(buf + sizeof(meta));
+			outAddrs.assign(addrs, addrs + hitCount);
+		}
+		return TRUE;
 	}
 #endif /*__linux__*/
 	std::vector<unsigned long> _GetAuxvSignature() {

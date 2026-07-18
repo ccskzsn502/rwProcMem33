@@ -1,5 +1,6 @@
 ﻿#include "rwProcMem_module.h"
 #include "cfi_bypass.h"
+#include "proc_search.h"
 
 #define MY_TASK_COMM_LEN 16
 
@@ -273,6 +274,16 @@ static ssize_t OnCmdHideKernelModule(struct ioctl_request *hdr, char __user* buf
 	return 0;
 }
 
+static ssize_t OnCmdSearchProcessMemory(struct ioctl_request *hdr, char __user* buf) {
+	struct pid * proc_pid_struct = (struct pid *)hdr->param1;
+	printk_debug(KERN_INFO "CMD_SEARCH_PROCESS_MEMORY\n");
+	printk_debug(KERN_INFO "proc_pid_struct*:0x%p buf_size:%llu\n",
+		(void*)proc_pid_struct, hdr->buf_size);
+	if (!proc_pid_struct)
+		return -EINVAL;
+	return search_process_memory(proc_pid_struct, buf, (size_t)hdr->buf_size);
+}
+
 static inline ssize_t DispatchCommand(struct ioctl_request *hdr, char __user* buf) {
 	switch (hdr->cmd) {
 	case CMD_INIT_DEVICE_INFO:
@@ -301,6 +312,8 @@ static inline ssize_t DispatchCommand(struct ioctl_request *hdr, char __user* bu
 		return OnCmdGetProcessCmdlineAddr(hdr, buf);
 	case CMD_HIDE_KERNEL_MODULE:
 		return OnCmdHideKernelModule(hdr, buf);
+	case CMD_SEARCH_PROCESS_MEMORY:
+		return OnCmdSearchProcessMemory(hdr, buf);
 	default:
 		return -EINVAL;
 	}

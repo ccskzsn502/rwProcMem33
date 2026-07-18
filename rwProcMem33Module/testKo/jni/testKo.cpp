@@ -116,6 +116,35 @@ int main(int argc, char *argv[]) {
 	b = rwDriver.GetProcessCmdline(hProcess, cmdline, sizeof(cmdline));
 	printf("调用驱动 GetProcessCmdline 返回值:%d,当前进程命令行:%s\n", b, cmdline);
 
+	//驱动_内核内搜索（避免用户态大缓冲闪退）
+	{
+		const char needle[] = "文本123";
+		// 上面写过一次，缓冲区可能已是“写入456”；用当前内容再搜
+		std::vector<uint64_t> hits;
+		BOOL truncated = FALSE;
+		BOOL sres = rwDriver.SearchProcessMemory(
+			hProcess,
+			0,
+			0,
+			CMemoryReaderWriter::SEARCH_VAL_BYTES,
+			szBuf,
+			(uint32_t)strlen(szBuf),
+			NULL,
+			1,
+			64,
+			CMemoryReaderWriter::SEARCH_PROT_ANY,
+			FALSE,
+			hits,
+			&truncated);
+		printf("调用驱动 SearchProcessMemory 返回值:%d, hits:%zu, truncated:%d\n",
+			sres, hits.size(), truncated);
+		for (size_t i = 0; i < hits.size() && i < 8; ++i) {
+			printf("  hit[%zu]=0x%" PRIx64 "%s\n", i, hits[i],
+				hits[i] == (uint64_t)(uintptr_t)pBuf ? " (self buffer)" : "");
+		}
+		(void)needle;
+	}
+
 	//驱动_关闭进程
 	rwDriver.CloseHandle(hProcess);
 	printf("调用驱动 CloseHandle %" PRIu64 "\n", hProcess);

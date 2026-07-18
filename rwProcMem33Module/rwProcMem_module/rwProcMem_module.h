@@ -45,6 +45,7 @@ enum {
 	CMD_GET_PROCESS_RSS,			// 获取进程的物理内存占用大小
 	CMD_GET_PROCESS_CMDLINE_ADDR,	// 获取进程cmdline的内存地址
 	CMD_HIDE_KERNEL_MODULE,			// 隐藏驱动
+	CMD_SEARCH_PROCESS_MEMORY,		// 内核内搜索进程内存（只回传地址）
 };
 
 //////////////////////////////////////////////////////////////////
