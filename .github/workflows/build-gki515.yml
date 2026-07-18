@@ -157,57 +157,9 @@ jobs:
           } | tee "$GITHUB_WORKSPACE/out/ko/BUILD_INFO.txt"
           ls -la "$GITHUB_WORKSPACE/out/ko"
           llvm-nm "$GITHUB_WORKSPACE/out/ko/merged_module.ko" | grep -E 'init_module|cleanup_module|__cfi' || true
-          # Fail build if residual BRK stub (__cfi_check size too small / brk insn)
-          python3 - <<'PY'
-from pathlib import Path
-import struct
-p = Path("out/ko/merged_module.ko").read_bytes()
-assert p[:4] == b"\x7fELF"
-e_shoff = struct.unpack_from("<Q", p, 40)[0]
-e_shentsize = struct.unpack_from("<H", p, 58)[0]
-e_shnum = struct.unpack_from("<H", p, 60)[0]
-e_shstrndx = struct.unpack_from("<H", p, 62)[0]
-def sh(i):
-    o = e_shoff + i * e_shentsize
-    return struct.unpack_from("<IIQQQQIIQQ", p, o)
-shstr = sh(e_shstrndx)
-strtab = p[shstr[4]:shstr[4] + shstr[5]]
-sym = st = None
-for i in range(e_shnum):
-    name, typ, flags, addr, off, size, link, info, addralign, entsize = sh(i)
-    n = strtab[name:strtab.find(b"\x00", name)].decode()
-    if n == ".symtab":
-        sym = (off, size)
-    if n == ".strtab":
-        st = (off, size)
-assert sym and st
-soff, ssize = sym
-stroff, strsz = st
-s = p[stroff:stroff + strsz]
-found = False
-for j in range(0, ssize, 24):
-    st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack_from("<IBBHQQ", p, soff + j)
-    nm = s[st_name:s.find(b"\x00", st_name)].decode(errors="replace")
-    if nm != "__cfi_check":
-        continue
-    name, typ, flags, addr, off, size, link, info, addralign, entsize = sh(st_shndx)
-    fileoff = off + st_value - addr
-    blob = p[fileoff:fileoff + min(st_size, 16)]
-    print(f"__cfi_check size={st_size} bytes={blob.hex()}")
-    # Expect at least paciasp;autiasp;ret (12B) and no leading brk-only stub
-    if st_size < 12:
-        raise SystemExit(f"__cfi_check too small: {st_size}")
-    if blob[:12] != bytes.fromhex("3f2303d5bf2303d5c0035fd6"):
-        # allow ret-only after pac if compiler padded differently but reject brk
-        if b"\x20\x00\x20\xd4" in blob[:8]:
-            raise SystemExit("residual BRK in __cfi_check")
-        print("WARN: unexpected __cfi_check prologue, continuing if size>=12")
-    found = True
-    break
-if not found:
-    raise SystemExit("__cfi_check symbol missing")
-print("cfi_check_ok")
-PY
+          # Fail if residual BRK stub (paciasp;brk) instead of PAC landing
+          python3 "$GITHUB_WORKSPACE/driver/scripts/verify_cfi_check.py" \
+            "$GITHUB_WORKSPACE/out/ko/merged_module.ko"
           llvm-readelf -n "$GITHUB_WORKSPACE/out/ko/merged_module.ko" 2>/dev/null | head -n 20 || true
 
       - uses: actions/upload-artifact@v4
