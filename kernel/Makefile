@@ -33,24 +33,28 @@ ccflags-y += -O3
 ccflags-y += -DCONFIG_MERGED_MODULE
 
 # --- CFI / LTO: must kill residual weak stubs at compile time ---
-# kbuild re-appends CC_FLAGS_CFI after ccflags-y; remove those first.
+# kbuild re-appends CC_FLAGS_CFI / CC_FLAGS_LTO after ccflags-y; strip first.
+# Do NOT put -fno-lto into LDFLAGS — ld.lld rejects it (CI failure).
 ccflags-remove-y += $(CC_FLAGS_CFI)
+ccflags-remove-y += $(CC_FLAGS_LTO)
 ccflags-remove-y += -fsanitize=cfi
 ccflags-remove-y += -fsanitize-cfi-cross-dso
+ccflags-remove-y += -flto
+ccflags-remove-y += -flto=thin
 ccflags-remove-y += -fvisibility=default
-# Module must not be compiled with CFI instrumentation.
+# Prefer kbuild disable macros when the GKI tree defines them.
+ccflags-y += $(DISABLE_CFI_CLANG)
+ccflags-y += $(DISABLE_LTO_CLANG)
+# Explicit fallbacks (Clang 14 / GKI 5.15). Compiler only — never LDFLAGS.
 ccflags-y += -fno-sanitize=cfi
-ccflags-y += $(call cc-option,-fno-sanitize-cfi-cross-dso)
-# ThinLTO re-emits residual __cfi_check.NN traps — disable for this OOT module.
 ccflags-y += -fno-lto
-ccflags-y += $(call cc-option,-fno-lto=thin)
-# Per-object belt-and-suspenders (order can still inject CFI into some units).
-CFLAGS_merged_main.o += -fno-sanitize=cfi -fno-lto
-CFLAGS_rw_core.o     += -fno-sanitize=cfi -fno-lto
-CFLAGS_hwbp_core.o   += -fno-sanitize=cfi -fno-lto
-# Module final link: no LTO bitcode merge of CFI stubs.
-LDFLAGS_merged_module.o += -fno-lto
-KBUILD_LDFLAGS_MODULE += -fno-lto
+# CFLAGS_MODULE is applied to every module .o by kbuild.
+CFLAGS_MODULE += -fno-sanitize=cfi -fno-lto
+# Per-object: keep bitcode/LTO off so residual CFI stubs are not re-emitted.
+CFLAGS_cfi_landing.o  += $(DISABLE_LTO_CLANG)
+CFLAGS_merged_main.o  += -fno-sanitize=cfi -fno-lto $(DISABLE_CFI_CLANG) $(DISABLE_LTO_CLANG)
+CFLAGS_rw_core.o      += -fno-sanitize=cfi -fno-lto $(DISABLE_CFI_CLANG) $(DISABLE_LTO_CLANG)
+CFLAGS_hwbp_core.o    += -fno-sanitize=cfi -fno-lto $(DISABLE_CFI_CLANG) $(DISABLE_LTO_CLANG)
 
 CFLAGS_merged_main.o += -I$(RW_DIR) -I$(HWBP_DIR)
 CFLAGS_rw_core.o     += -I$(RW_DIR)
