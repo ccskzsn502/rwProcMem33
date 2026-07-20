@@ -82,33 +82,12 @@ static const struct proc_ops merged_proc_ops = {
 };
 
 /*
- * GKI CFI may call module __cfi_check before init runs.
- * Historical stable dual modules used post-link pad:
- *   paciasp; autiasp; ret
- * Current -fno-sanitize=cfi residual was only 8B: paciasp; brk → hard reboot.
- * Provide a real landing in source so compile→insmod needs no Python.
- *
- * Match include/linux/cfi.h prototype (uint64_t id, ...).
- * Do not nest noinline inside __attribute__: kernel noinline macro expands
- * to __attribute__((__noinline__)) and breaks nested attributes.
+ * Module CFI landing lives in cfi_landing.S (strong asm symbols):
+ *   __cfi_check / __cfi_check_fail = bti; paciasp; autiasp; ret
+ * Do NOT redefine them here — C/LTO residuals used to leave
+ * weak __cfi_check.NN = paciasp;brk and hard-reboot on insmod.
+ * Makefile strips CC_FLAGS_CFI + ThinLTO so those stubs are not emitted.
  */
-__attribute__((naked, used, no_sanitize("cfi")))
-void __cfi_check(uint64_t id, void *ptr, void *diag)
-{
-	/* args unused: accept-all landing pad */
-	asm volatile(
-		"paciasp\n"
-		"autiasp\n"
-		"ret\n"
-	);
-}
-
-__attribute__((used, no_sanitize("cfi")))
-void __cfi_check_fail(void *data)
-{
-	/* accept-all: never panic from module CFI fail path */
-	(void)data;
-}
 
 static int __init merged_init(void)
 {

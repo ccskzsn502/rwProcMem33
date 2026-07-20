@@ -50,7 +50,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: kernel/common
-          key: gki-common-android13-5.15-742fd6fce289-modsym-emptycrc-cfithinlto-v3
+          key: gki-common-android13-5.15-742fd6fce289-modsym-emptycrc-cfithinlto-v4-asmlanding
 
       - name: Fetch Google kernel/common GKI
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -117,15 +117,16 @@ jobs:
           grep -E 'LINUX_VERSION|UTS_RELEASE|SUBLEVEL' include/generated/uapi/linux/version.h include/config/kernel.release 2>/dev/null || true
           cat include/config/kernel.release || true
 
-      - name: Build merged_module.ko (lsnbm empty-CRC, no py)
+      - name: Build merged_module.ko (compile-time CFI clean, no post-link py)
         run: |
           set -eux
           export PATH="/usr/lib/llvm-14/bin:$PATH"
           KDIR="$GITHUB_WORKSPACE/kernel/common"
           MDIR="$GITHUB_WORKSPACE/driver/kernel"
           test -f "$MDIR/Makefile"
+          test -f "$MDIR/cfi_landing.S"
           cd "$KDIR"
-          # Hide Module.symvers so modpost cannot import symbol CRCs (lsnbm NO_CRC).
+          # Hide Module.symvers so modpost cannot import host CRCs (lsnbm NO_CRC).
           if [ -f Module.symvers ]; then
             mv Module.symvers Module.symvers.no_crc_bak
           fi
@@ -150,14 +151,19 @@ jobs:
             echo "clang=$(clang --version | head -n1)"
             echo "module=merged_module.ko"
             echo "layout=kernel/ single-node R/W+search+HWBP"
-            echo "build_style=lsnbm-empty-crc+fno-sanitize=cfi+source-pac-landing+runtime-slowpath"
+            echo "build_style=lsnbm-empty-crc+strip-CC_FLAGS_CFI+fno-lto+asm-cfi-landing+runtime-slowpath"
             echo "post_link_py=none"
-            echo "cfi_check=source paciasp;autiasp;ret in merged_main.c"
+            echo "cfi_check=cfi_landing.S bti;paciasp;autiasp;ret (strong)"
             echo "load=insmod merged_module.ko (root); init patches __cfi_slowpath"
           } | tee "$GITHUB_WORKSPACE/out/ko/BUILD_INFO.txt"
           ls -la "$GITHUB_WORKSPACE/out/ko"
+          echo "=== CFI symbols (must NOT contain __cfi_check.N) ==="
           llvm-nm "$GITHUB_WORKSPACE/out/ko/merged_module.ko" | grep -E 'init_module|cleanup_module|__cfi' || true
-          # Fail if residual BRK stub (paciasp;brk) instead of PAC landing
+          if llvm-nm "$GITHUB_WORKSPACE/out/ko/merged_module.ko" | grep -E '__cfi_check\.[0-9]|__cfi_check_fail\.[0-9]'; then
+            echo "ERROR: residual numbered CFI stubs still present — compile flags incomplete" >&2
+            exit 1
+          fi
+          # Fail if residual BRK / numbered weak stubs
           python3 "$GITHUB_WORKSPACE/driver/scripts/verify_cfi_check.py" \
             "$GITHUB_WORKSPACE/out/ko/merged_module.ko"
           llvm-readelf -n "$GITHUB_WORKSPACE/out/ko/merged_module.ko" 2>/dev/null | head -n 20 || true

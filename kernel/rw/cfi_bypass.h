@@ -5,12 +5,13 @@
  * Runtime CFI bypass for GKI 5.10/5.15, adapted from lsnbm/Linux-android-arm64
  * (export_fun.h bypass_cfi).
  *
- * lsnbm path (preferred, no post-link py):
+ * Compile-time clean path (no post-link py):
  *  - empty-CRC OOT build (hide Module.symvers + KBUILD_MODPOST_WARN=1)
- *  - module built without incomplete __cfi_check (-fno-sanitize=cfi)
+ *  - Makefile: strip CC_FLAGS_CFI + -fno-sanitize=cfi + -fno-lto
+ *  - strong asm landing: kernel/cfi_landing.S (__cfi_check / __cfi_check_fail)
  *  - this init-time patch of kernel __cfi_slowpath / __cfi_slowpath_diag → RET
  *
- * Then: compile → insmod directly. No Python patch step.
+ * Then: compile → insmod directly. Residual weak __cfi_check.NN must not exist.
  */
 #include <linux/kprobes.h>
 #include <linux/version.h>
