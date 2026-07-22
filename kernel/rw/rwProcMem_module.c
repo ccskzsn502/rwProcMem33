@@ -90,53 +90,129 @@ static ssize_t OnCmdCloseProcess(struct ioctl_request *hdr, char __user* buf) {
 	return 0;
 }
 
+/*
+ * Classic physical-page R/W (pre-mirror). No pin_user_pages / mmu_notifier.
+ * Translate under mmap_lock inside get_proc_phy_addr; only use returned PA
+ * (never keep pte* across unlock). Cap size; short-read on holes.
+ */
 static ssize_t OnCmdReadProcessMemory(struct ioctl_request *hdr, char __user* buf) {
-	struct pid * proc_pid_struct = proc_handle_get(hdr->param1);
+	struct pid *proc_pid_struct = proc_handle_get(hdr->param1);
 	size_t proc_virt_addr = (size_t)hdr->param2;
-	bool is_force_read = hdr->param3 == 1 ? true : false;
+	bool is_force_read = hdr->param3 == 1;
 	size_t size = (size_t)hdr->buf_size;
-	ssize_t ret;
-	size_t end_addr;
+	size_t read_size = 0;
+	void *bounce = NULL;
 
 	if (!proc_pid_struct)
 		return -EINVAL;
-	if (size == 0 || size > (16UL * 1024UL * 1024UL)) {
+	if (size == 0 || size > (256UL * 1024UL)) {
 		release_proc_pid_struct(proc_pid_struct);
 		return -EINVAL;
 	}
-	end_addr = proc_virt_addr + size;
-	if (end_addr < proc_virt_addr) {
+	if (proc_virt_addr + size < proc_virt_addr) {
 		release_proc_pid_struct(proc_pid_struct);
 		return -EINVAL;
 	}
-	ret = mirror_copy_from_remote(proc_pid_struct, proc_virt_addr, buf, size, is_force_read);
+
+	if (!is_force_read) {
+		if (!check_proc_map_can_read(proc_pid_struct, proc_virt_addr, size)) {
+			release_proc_pid_struct(proc_pid_struct);
+			return -EFAULT;
+		}
+	}
+
+	bounce = x_kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!bounce) {
+		release_proc_pid_struct(proc_pid_struct);
+		return -ENOMEM;
+	}
+
+	while (read_size < size) {
+		size_t va = proc_virt_addr + read_size;
+		size_t chunk = size - read_size;
+		size_t phy;
+		size_t page_left;
+		size_t got;
+
+		page_left = PAGE_SIZE - (va & (PAGE_SIZE - 1));
+		if (chunk > page_left)
+			chunk = page_left;
+
+		/* pte discarded after translate — only PA is used */
+		phy = get_proc_phy_addr(proc_pid_struct, va, NULL);
+		if (!phy)
+			break;
+
+		got = read_ram_physical_addr_bounce(false, phy, buf + read_size, chunk, bounce);
+		if (!got)
+			break;
+		read_size += got;
+		if (got < chunk)
+			break;
+		if (need_resched())
+			cond_resched();
+	}
+
+	kfree(bounce);
 	release_proc_pid_struct(proc_pid_struct);
-	return ret;
+	return (ssize_t)read_size;
 }
 
 static ssize_t OnCmdWriteProcessMemory(struct ioctl_request *hdr, char __user* buf) {
-	struct pid * proc_pid_struct = proc_handle_get(hdr->param1);
+	struct pid *proc_pid_struct = proc_handle_get(hdr->param1);
 	size_t proc_virt_addr = (size_t)hdr->param2;
-	bool is_force_write = hdr->param3 == 1 ? true : false;
+	bool is_force_write = hdr->param3 == 1;
 	size_t size = (size_t)hdr->buf_size;
-	ssize_t ret;
-	size_t end_addr;
+	size_t write_size = 0;
 
 	if (!proc_pid_struct)
 		return -EINVAL;
-	if (size == 0 || size > (16UL * 1024UL * 1024UL)) {
+	if (size == 0 || size > (256UL * 1024UL)) {
 		release_proc_pid_struct(proc_pid_struct);
 		return -EINVAL;
 	}
-	end_addr = proc_virt_addr + size;
-	if (end_addr < proc_virt_addr) {
+	if (proc_virt_addr + size < proc_virt_addr) {
 		release_proc_pid_struct(proc_pid_struct);
 		return -EINVAL;
 	}
-	ret = mirror_copy_to_remote(proc_pid_struct, proc_virt_addr, buf, size, is_force_write);
+
+	/* No PTE poke. Require writable VMA unless force (still only present pages). */
+	if (!is_force_write) {
+		if (!check_proc_map_can_write(proc_pid_struct, proc_virt_addr, size)) {
+			release_proc_pid_struct(proc_pid_struct);
+			return -EFAULT;
+		}
+	}
+
+	while (write_size < size) {
+		size_t va = proc_virt_addr + write_size;
+		size_t chunk = size - write_size;
+		size_t phy;
+		size_t page_left;
+		size_t got;
+
+		page_left = PAGE_SIZE - (va & (PAGE_SIZE - 1));
+		if (chunk > page_left)
+			chunk = page_left;
+
+		phy = get_proc_phy_addr(proc_pid_struct, va, NULL);
+		if (!phy)
+			break;
+
+		got = write_ram_physical_addr(phy, buf + write_size, false, chunk);
+		if (!got)
+			break;
+		write_size += got;
+		if (got < chunk)
+			break;
+		if (need_resched())
+			cond_resched();
+	}
+
 	release_proc_pid_struct(proc_pid_struct);
-	return ret;
+	return (ssize_t)write_size;
 }
+
 
 static ssize_t OnCmdGetProcessMapsCount(struct ioctl_request *hdr, char __user* buf) {
 	struct pid * proc_pid_struct = proc_handle_get(hdr->param1);
