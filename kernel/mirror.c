@@ -1,5 +1,6 @@
 // 远端进程只读页映射：控制路径固定页面，读取路径直接访问同一物理页
 #include "mirror.h"
+#include "phy_mem.h"
 
 #include <linux/anon_inodes.h>
 #include <linux/atomic.h>
@@ -80,152 +81,150 @@ static bool mirror_pin_stopping;
 #define FOLL_FORCE 0
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0) && \
-    LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
+
+/* GKI often does not EXPORT_SYMBOL pin/mmu/kthread helpers.
+ * Resolve via kallsyms; if missing, use phy_mem fallback for R/W.
+ */
 
 typedef unsigned long (*mirror_kallsyms_lookup_name_t)(const char *name);
 
-static typeof(&mmu_notifier_register) mirror_mmu_notifier_register_fn;
-static typeof(&mmu_notifier_unregister) mirror_mmu_notifier_unregister_fn;
-static typeof(&pin_user_pages_fast_only) mirror_pin_user_pages_fast_only_fn;
-static typeof(&kthread_use_mm) mirror_kthread_use_mm_fn;
-static typeof(&kthread_unuse_mm) mirror_kthread_unuse_mm_fn;
+static mirror_kallsyms_lookup_name_t mirror_kallsyms_lookup_name_fn;
 
-static __nocfi unsigned long mirror_call_kallsyms_lookup_name(
-    mirror_kallsyms_lookup_name_t fn, const char *name)
+static int (*mirror_mmu_notifier_register_fn)(struct mmu_notifier *, struct mm_struct *);
+static void (*mirror_mmu_notifier_unregister_fn)(struct mmu_notifier *, struct mm_struct *);
+static int (*mirror_pin_user_pages_fast_only_fn)(unsigned long, int, unsigned int, struct page **);
+/* opaque remote pin: we call through a thin wrapper that matches 5.15 ABI */
+static long (*mirror_pin_user_pages_remote_fn)(struct mm_struct *, unsigned long, unsigned long,
+					      unsigned int, struct page **, struct vm_area_struct **, int *);
+static void (*mirror_unpin_user_pages_fn)(struct page **, unsigned long);
+static void (*mirror_kthread_use_mm_fn)(struct mm_struct *);
+static void (*mirror_kthread_unuse_mm_fn)(struct mm_struct *);
+
+/* 0 = pin path ready; 1 = phy fallback only */
+static int mirror_phy_only = 1;
+
+static __nocfi unsigned long mirror_lookup(const char *name)
 {
-    return fn(name);
+	if (!mirror_kallsyms_lookup_name_fn)
+		return 0;
+	return mirror_kallsyms_lookup_name_fn(name);
 }
 
-static unsigned long mirror_resolve_6_1_symbol(
-    mirror_kallsyms_lookup_name_t lookup, const char *name)
+static int mirror_resolve_symbols(void)
 {
-    unsigned long address;
+	struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
+	unsigned long addr;
+	int ret;
 
-    address = mirror_call_kallsyms_lookup_name(lookup, name);
-    if (!address)
-        pr_err("[ook] 6.1 symbol not found: %s\n", name);
-    return address;
+	mirror_phy_only = 1;
+	mirror_kallsyms_lookup_name_fn = NULL;
+	mirror_mmu_notifier_register_fn = NULL;
+	mirror_mmu_notifier_unregister_fn = NULL;
+	mirror_pin_user_pages_fast_only_fn = NULL;
+	mirror_pin_user_pages_remote_fn = NULL;
+	mirror_unpin_user_pages_fn = NULL;
+	mirror_kthread_use_mm_fn = NULL;
+	mirror_kthread_unuse_mm_fn = NULL;
+
+	ret = register_kprobe(&kp);
+	if (ret) {
+		pr_warn("mirror: kprobe kallsyms_lookup_name failed %d, phy fallback\n", ret);
+		return 0;
+	}
+	mirror_kallsyms_lookup_name_fn =
+		(mirror_kallsyms_lookup_name_t)(unsigned long)kp.addr;
+	unregister_kprobe(&kp);
+	if (!mirror_kallsyms_lookup_name_fn) {
+		pr_warn("mirror: kallsyms_lookup_name NULL, phy fallback\n");
+		return 0;
+	}
+
+	addr = mirror_lookup("mmu_notifier_register");
+	mirror_mmu_notifier_register_fn = (void *)addr;
+	addr = mirror_lookup("mmu_notifier_unregister");
+	mirror_mmu_notifier_unregister_fn = (void *)addr;
+
+	addr = mirror_lookup("pin_user_pages_fast_only");
+	if (!addr)
+		addr = mirror_lookup("pin_user_pages_fast");
+	mirror_pin_user_pages_fast_only_fn = (void *)addr;
+
+	addr = mirror_lookup("pin_user_pages_remote");
+	mirror_pin_user_pages_remote_fn = (void *)addr;
+
+	addr = mirror_lookup("unpin_user_pages");
+	mirror_unpin_user_pages_fn = (void *)addr;
+
+	addr = mirror_lookup("kthread_use_mm");
+	mirror_kthread_use_mm_fn = (void *)addr;
+	addr = mirror_lookup("kthread_unuse_mm");
+	mirror_kthread_unuse_mm_fn = (void *)addr;
+
+	if (mirror_unpin_user_pages_fn &&
+	    (mirror_pin_user_pages_remote_fn || mirror_pin_user_pages_fast_only_fn) &&
+	    mirror_kthread_use_mm_fn && mirror_kthread_unuse_mm_fn) {
+		mirror_phy_only = 0;
+		pr_info("mirror: pin path ready (kallsyms)\n");
+	} else {
+		mirror_phy_only = 1;
+		pr_warn("mirror: pin symbols incomplete, phy fallback for R/W\n");
+	}
+	return 0;
 }
 
-static int mirror_resolve_6_1_symbols(void)
+static __nocfi int mirror_mmu_notifier_register(struct mmu_notifier *n, struct mm_struct *mm)
 {
-    struct kprobe kp = {
-        .symbol_name = "kallsyms_lookup_name",
-    };
-    mirror_kallsyms_lookup_name_t lookup;
-    unsigned long address;
-    int ret;
-
-    ret = register_kprobe(&kp);
-    if (ret) {
-        pr_err("[ook] cannot resolve kallsyms_lookup_name: %d\n", ret);
-        return ret;
-    }
-    lookup = (mirror_kallsyms_lookup_name_t)(unsigned long)kp.addr;
-    unregister_kprobe(&kp);
-    if (!lookup)
-        return -ENOENT;
-
-    address = mirror_resolve_6_1_symbol(lookup, "mmu_notifier_register");
-    if (!address)
-        return -ENOENT;
-    mirror_mmu_notifier_register_fn =
-        (typeof(mirror_mmu_notifier_register_fn))address;
-
-    address = mirror_resolve_6_1_symbol(lookup, "mmu_notifier_unregister");
-    if (!address)
-        return -ENOENT;
-    mirror_mmu_notifier_unregister_fn =
-        (typeof(mirror_mmu_notifier_unregister_fn))address;
-
-    address = mirror_resolve_6_1_symbol(lookup, "pin_user_pages_fast_only");
-    if (!address)
-        return -ENOENT;
-    mirror_pin_user_pages_fast_only_fn =
-        (typeof(mirror_pin_user_pages_fast_only_fn))address;
-
-    address = mirror_resolve_6_1_symbol(lookup, "kthread_use_mm");
-    if (!address)
-        return -ENOENT;
-    mirror_kthread_use_mm_fn = (typeof(mirror_kthread_use_mm_fn))address;
-
-    address = mirror_resolve_6_1_symbol(lookup, "kthread_unuse_mm");
-    if (!address)
-        return -ENOENT;
-    mirror_kthread_unuse_mm_fn = (typeof(mirror_kthread_unuse_mm_fn))address;
-    return 0;
+	if (!mirror_mmu_notifier_register_fn)
+		return -ENOENT;
+	return mirror_mmu_notifier_register_fn(n, mm);
 }
 
-static __nocfi int mirror_mmu_notifier_register(
-    struct mmu_notifier *notifier, struct mm_struct *mm)
+static __nocfi void mirror_mmu_notifier_unregister(struct mmu_notifier *n, struct mm_struct *mm)
 {
-    return mirror_mmu_notifier_register_fn(notifier, mm);
+	if (mirror_mmu_notifier_unregister_fn)
+		mirror_mmu_notifier_unregister_fn(n, mm);
 }
 
-static __nocfi void mirror_mmu_notifier_unregister(
-    struct mmu_notifier *notifier, struct mm_struct *mm)
+static __nocfi int mirror_pin_user_pages_fast_only(unsigned long start, int nr_pages,
+						  unsigned int gup_flags, struct page **pages)
 {
-    mirror_mmu_notifier_unregister_fn(notifier, mm);
+	if (!mirror_pin_user_pages_fast_only_fn)
+		return -ENOENT;
+	return mirror_pin_user_pages_fast_only_fn(start, nr_pages, gup_flags, pages);
 }
 
-static __nocfi int mirror_pin_user_pages_fast_only(
-    unsigned long start, int nr_pages, unsigned int gup_flags,
-    struct page **pages)
+static __nocfi long mirror_pin_user_pages_remote(struct mm_struct *mm, unsigned long start,
+						unsigned long nr_pages, unsigned int gup_flags,
+						struct page **pages)
 {
-    return mirror_pin_user_pages_fast_only_fn(start, nr_pages, gup_flags,
-                                              pages);
+	if (!mirror_pin_user_pages_remote_fn)
+		return -ENOENT;
+	/* Linux 5.15: mirror_pin_user_pages_remote(mm, start, nr_pages, gup_flags, pages, vmas, locked) */
+	return mirror_pin_user_pages_remote_fn(mm, start, nr_pages, gup_flags, pages, NULL, NULL);
+}
+
+static __nocfi void mirror_x_unpin_user_pages(struct page **pages, unsigned long npages)
+{
+	if (mirror_unpin_user_pages_fn && npages)
+		mirror_unpin_user_pages_fn(pages, npages);
 }
 
 static __nocfi void mirror_kthread_use_mm(struct mm_struct *mm)
 {
-    mirror_kthread_use_mm_fn(mm);
+	if (mirror_kthread_use_mm_fn)
+		mirror_kthread_use_mm_fn(mm);
 }
 
 static __nocfi void mirror_kthread_unuse_mm(struct mm_struct *mm)
 {
-    mirror_kthread_unuse_mm_fn(mm);
+	if (mirror_kthread_unuse_mm_fn)
+		mirror_kthread_unuse_mm_fn(mm);
 }
 
-#else
-
-static inline int mirror_resolve_6_1_symbols(void)
+static int mirror_resolve_6_1_symbols(void)
 {
-    return 0;
+	return mirror_resolve_symbols();
 }
-
-static inline int mirror_mmu_notifier_register(
-    struct mmu_notifier *notifier, struct mm_struct *mm)
-{
-    return mmu_notifier_register(notifier, mm);
-}
-
-static inline void mirror_mmu_notifier_unregister(
-    struct mmu_notifier *notifier, struct mm_struct *mm)
-{
-    mmu_notifier_unregister(notifier, mm);
-}
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
-static inline int mirror_pin_user_pages_fast_only(
-    unsigned long start, int nr_pages, unsigned int gup_flags,
-    struct page **pages)
-{
-    return pin_user_pages_fast_only(start, nr_pages, gup_flags, pages);
-}
-#endif
-
-static inline void mirror_kthread_use_mm(struct mm_struct *mm)
-{
-    kthread_use_mm(mm);
-}
-
-static inline void mirror_kthread_unuse_mm(struct mm_struct *mm)
-{
-    kthread_unuse_mm(mm);
-}
-
-#endif
 
 static void mirror_mark_invalid(struct mirror_context *context)
 {
@@ -368,7 +367,7 @@ static void mirror_target_put(struct mirror_target *target)
 static void mirror_unpin_pages(struct mirror_context *context)
 {
     if (context->pinned_pages) {
-        unpin_user_pages(context->pages, context->pinned_pages);
+        mirror_x_unpin_user_pages(context->pages, context->pinned_pages);
         context->pinned_pages = 0;
     }
     if (context->reserved_pages) {
@@ -577,17 +576,17 @@ static void mirror_pin_worker(struct mirror_pin_work *job)
     int pinned;
     int ret;
 
+    if (mirror_phy_only) {
+        job->result = -ENOENT;
+        return;
+    }
+
     mirror_kthread_use_mm(job->mm);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
     pinned = mirror_pin_user_pages_fast_only(job->address, job->nr_pages,
                                              FOLL_LONGTERM, job->pages);
-#else
-    pinned = pin_user_pages_fast(job->address, job->nr_pages,
-                                 FOLL_LONGTERM | FOLL_NOFAULT, job->pages);
-#endif
     if (pinned != job->nr_pages) {
         if (pinned > 0)
-            unpin_user_pages(job->pages, pinned);
+            mirror_x_unpin_user_pages(job->pages, pinned);
 
         /* 再次确认驻留状态，避免排队期间的换出触发远程缺页。 */
         mmap_read_lock(job->mm);
@@ -598,20 +597,9 @@ static void mirror_pin_worker(struct mirror_pin_work *job)
         if (ret) {
             pinned = ret;
         } else {
-            /* slow GUP 仅迁移已驻留 CMA 页，仍要求 long-term pin。 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-            pinned = pin_user_pages_remote(job->mm, job->address,
-                                           job->nr_pages,
-                                           FOLL_LONGTERM |
-                                               MIRROR_SLOW_GUP_NOFAULT,
-                                           job->pages, NULL);
-#else
-            pinned = pin_user_pages_remote(job->mm, job->address,
-                                           job->nr_pages,
-                                           FOLL_LONGTERM |
-                                               MIRROR_SLOW_GUP_NOFAULT,
-                                           job->pages, NULL, NULL);
-#endif
+            pinned = (int)mirror_pin_user_pages_remote(
+                job->mm, job->address, (unsigned long)job->nr_pages,
+                FOLL_LONGTERM | MIRROR_SLOW_GUP_NOFAULT, job->pages);
         }
         mmap_read_unlock(job->mm);
     }
@@ -720,7 +708,7 @@ static long mirror_pin_remote_pages(struct mirror_context *context)
                                           nr_pages, context->pages);
         if (pinned != nr_pages) {
             if (pinned > 0)
-                unpin_user_pages(context->pages, pinned);
+                mirror_x_unpin_user_pages(context->pages, pinned);
             spin_lock_irqsave(&target->lock, flags);
             if (target->released) {
                 spin_unlock_irqrestore(&target->lock, flags);
@@ -744,7 +732,7 @@ static long mirror_pin_remote_pages(struct mirror_context *context)
             return pinned;
         }
         spin_unlock_irqrestore(&target->lock, flags);
-        unpin_user_pages(context->pages, pinned);
+        mirror_x_unpin_user_pages(context->pages, pinned);
     }
     return -EAGAIN;
 }
@@ -777,6 +765,9 @@ int mirror_create_fd(pid_t pid, unsigned long remote_addr,
     unsigned long flags;
     long pinned;
     int ret;
+
+    if (mirror_phy_only || !mirror_mmu_notifier_register_fn)
+        return -EOPNOTSUPP;
 
     if (pid <= 0 || !length || length > MIRROR_MAX_SIZE ||
         !PAGE_ALIGNED(remote_addr) || !PAGE_ALIGNED(length) ||
@@ -850,6 +841,105 @@ int mirror_create_fd(pid_t pid, unsigned long remote_addr,
 }
 
 
+
+/* phy fallback when pin symbols unavailable on GKI */
+
+static ssize_t mirror_copy_phy(struct pid *pid_struct, unsigned long remote_addr,
+			       char *buf, size_t size, bool to_remote, bool is_user, bool force)
+{
+	struct task_struct *task;
+	struct mm_struct *mm;
+	size_t done = 0;
+	void *bounce = NULL;
+
+	if (!pid_struct || !buf || !size)
+		return -EINVAL;
+
+	rcu_read_lock();
+	task = pid_task(pid_struct, PIDTYPE_PID);
+	if (task)
+		get_task_struct(task);
+	rcu_read_unlock();
+	if (!task)
+		return -ESRCH;
+	mm = get_task_mm(task);
+	put_task_struct(task);
+	if (!mm)
+		return -ESRCH;
+
+	if (!force) {
+		struct vm_area_struct *vma;
+		mmap_read_lock(mm);
+		vma = find_vma(mm, remote_addr);
+		if (!vma || vma->vm_start > remote_addr ||
+		    vma->vm_end < remote_addr + size) {
+			mmap_read_unlock(mm);
+			mmput(mm);
+			return -EFAULT;
+		}
+		if (to_remote) {
+			if (!(vma->vm_flags & VM_WRITE)) {
+				mmap_read_unlock(mm);
+				mmput(mm);
+				return -EFAULT;
+			}
+		} else if (!(vma->vm_flags & VM_READ)) {
+			mmap_read_unlock(mm);
+			mmput(mm);
+			return -EFAULT;
+		}
+		mmap_read_unlock(mm);
+	}
+
+	if (is_user && !to_remote) {
+		bounce = kmalloc(PAGE_SIZE, GFP_KERNEL);
+		if (!bounce) {
+			mmput(mm);
+			return -ENOMEM;
+		}
+	}
+
+	while (done < size) {
+		size_t cur = remote_addr + done;
+		size_t want = size - done;
+		size_t pfn_sz;
+		size_t phy;
+		pte_t *pte = NULL;
+		size_t got;
+
+		phy = va_to_pa_mm(mm, cur, &pte);
+		if (!phy || !pte || pte_none(*pte))
+			break;
+#ifdef pte_present
+		if (!pte_present(*pte))
+			break;
+#endif
+		if (!to_remote && !force && !is_pte_can_read(pte))
+			break;
+		if (to_remote && !force && !is_pte_can_write(pte))
+			break;
+
+		pfn_sz = size_inside_page(phy, want > PAGE_SIZE ? PAGE_SIZE : want);
+		if (to_remote) {
+			got = write_ram_physical_addr(phy, buf + done, !is_user, pfn_sz);
+		} else {
+			if (is_user)
+				got = read_ram_physical_addr_bounce(false, phy, buf + done, pfn_sz, bounce);
+			else
+				got = read_ram_physical_addr_bounce(true, phy, buf + done, pfn_sz, NULL);
+		}
+		if (!got)
+			break;
+		done += got;
+		if (need_resched())
+			cond_resched();
+	}
+
+	kfree(bounce);
+	mmput(mm);
+	return (ssize_t)done;
+}
+
 /* -------- one-shot pin+copy (primary R/W path) -------- */
 
 static long mirror_pin_remote_range(struct mm_struct *mm,
@@ -863,20 +953,22 @@ static long mirror_pin_remote_range(struct mm_struct *mm,
     long pinned;
     int ret;
 
+    if (mirror_phy_only)
+        return -ENOENT;
+
     if (for_write)
         gup_flags |= FOLL_WRITE;
     if (force)
         gup_flags |= FOLL_FORCE;
 
     mirror_kthread_use_mm(mm);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
-    pinned = mirror_pin_user_pages_fast_only(start, (int)nr_pages, gup_flags, pages);
-#else
-    pinned = pin_user_pages_fast(start, (int)nr_pages, gup_flags | FOLL_NOFAULT, pages);
-#endif
+    pinned = -ENOENT;
+    if (mirror_pin_user_pages_fast_only_fn)
+        pinned = mirror_pin_user_pages_fast_only(start, (int)nr_pages, gup_flags, pages);
+
     if (pinned != (long)nr_pages) {
         if (pinned > 0)
-            unpin_user_pages(pages, pinned);
+            mirror_x_unpin_user_pages(pages, pinned);
         mmap_read_lock(mm);
         ret = walk_page_range(mm, start,
                               start + nr_pages * PAGE_SIZE,
@@ -884,21 +976,16 @@ static long mirror_pin_remote_range(struct mm_struct *mm,
         if (ret) {
             pinned = ret;
         } else {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-            pinned = pin_user_pages_remote(mm, start, (int)nr_pages,
-                                           gup_flags | MIRROR_SLOW_GUP_NOFAULT,
-                                           pages, NULL);
-#else
-            pinned = pin_user_pages_remote(mm, start, (int)nr_pages,
-                                           gup_flags | MIRROR_SLOW_GUP_NOFAULT,
-                                           pages, NULL, NULL);
-#endif
+            pinned = mirror_pin_user_pages_remote(mm, start, nr_pages,
+                                                  gup_flags | MIRROR_SLOW_GUP_NOFAULT,
+                                                  pages);
         }
         mmap_read_unlock(mm);
     }
     mirror_kthread_unuse_mm(mm);
     return pinned;
 }
+
 
 static ssize_t mirror_copy_pages_to_user(struct page **pages,
                                          unsigned long page_off,
@@ -989,6 +1076,8 @@ static ssize_t mirror_copy_remote_common(struct pid *pid_struct,
     end_addr = remote_addr + size;
     if (end_addr < remote_addr)
         return -EINVAL;
+    if (mirror_phy_only)
+        return mirror_copy_phy(pid_struct, remote_addr, (char *)ubuf, size, to_remote, true, force);
 
     rcu_read_lock();
     task = pid_task(pid_struct, PIDTYPE_PID);
@@ -1048,7 +1137,7 @@ static ssize_t mirror_copy_remote_common(struct pid *pid_struct,
     pinned = mirror_pin_remote_range(mm, start_page, nr_pages, pages, to_remote, force);
     if (pinned != (long)nr_pages) {
         if (pinned > 0)
-            unpin_user_pages(pages, pinned);
+            mirror_x_unpin_user_pages(pages, pinned);
         kfree(pages);
         mmput(mm);
         /* Not present / pin failed: return 0-style short read for non-force consumers */
@@ -1062,7 +1151,7 @@ static ssize_t mirror_copy_remote_common(struct pid *pid_struct,
     else
         copied = mirror_copy_pages_to_user(pages, page_off, ubuf, size);
 
-    unpin_user_pages(pages, nr_pages);
+    mirror_x_unpin_user_pages(pages, nr_pages);
     kfree(pages);
     mmput(mm);
     return copied;
@@ -1089,6 +1178,8 @@ ssize_t mirror_copy_from_remote_kbuf(struct pid *pid_struct,
     end_addr = remote_addr + size;
     if (end_addr < remote_addr)
         return -EINVAL;
+    if (mirror_phy_only)
+        return mirror_copy_phy(pid_struct, remote_addr, kbuf, size, false, false, force);
 
     rcu_read_lock();
     task = pid_task(pid_struct, PIDTYPE_PID);
@@ -1134,7 +1225,7 @@ ssize_t mirror_copy_from_remote_kbuf(struct pid *pid_struct,
     pinned = mirror_pin_remote_range(mm, start_page, nr_pages, pages, false, force);
     if (pinned != (long)nr_pages) {
         if (pinned > 0)
-            unpin_user_pages(pages, pinned);
+            mirror_x_unpin_user_pages(pages, pinned);
         kfree(pages);
         mmput(mm);
         if (pinned == -ENOENT || pinned == -EFAULT || pinned == 0)
@@ -1143,7 +1234,7 @@ ssize_t mirror_copy_from_remote_kbuf(struct pid *pid_struct,
     }
 
     copied = mirror_copy_pages_to_kbuf(pages, page_off, kbuf, size);
-    unpin_user_pages(pages, nr_pages);
+    mirror_x_unpin_user_pages(pages, nr_pages);
     kfree(pages);
     mmput(mm);
     return copied;
