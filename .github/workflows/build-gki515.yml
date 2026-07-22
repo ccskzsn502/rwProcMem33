@@ -1,0 +1,169 @@
+name: Build GKI merged_module.ko
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+env:
+  # Google kernel/common GKI; not OEM. API uses LINUX_VERSION_CODE from tree.
+  GKI_BRANCH: android13-5.15
+  GKI_COMMIT: 742fd6fce289
+  ARCH: arm64
+
+jobs:
+  build-ko:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: driver
+
+      - name: Install deps and Clang 14
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            git wget curl ca-certificates python3 rsync cpio unzip zip \
+            xz-utils lz4 zstd dwarves \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            clang-14 lld-14 llvm-14
+          for tool in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip llvm-readelf; do
+            if [ -x "/usr/bin/${tool}-14" ]; then
+              sudo ln -sfn "/usr/bin/${tool}-14" "/usr/bin/${tool}"
+            fi
+          done
+          if [ -d /usr/lib/llvm-14/bin ]; then
+            echo "/usr/lib/llvm-14/bin" >> "$GITHUB_PATH"
+            export PATH="/usr/lib/llvm-14/bin:$PATH"
+          fi
+          clang --version
+          ld.lld --version
+
+      - name: Cache GKI sources
+        id: cache-kernel
+        uses: actions/cache@v4
+        with:
+          path: kernel/common
+          key: gki-common-android13-5.15-742fd6fce289-modsym-emptycrc-cfithinlto-v3
+
+      - name: Fetch Google kernel/common GKI
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          mkdir -p kernel
+          git clone --filter=blob:none --no-checkout https://android.googlesource.com/kernel/common kernel/common
+          cd kernel/common
+          git fetch --depth 1 origin "${GKI_COMMIT}" || git fetch --depth 1 origin "${GKI_BRANCH}"
+          if git cat-file -t "${GKI_COMMIT}" >/dev/null 2>&1; then
+            git checkout --force "${GKI_COMMIT}"
+          else
+            echo "WARN: commit ${GKI_COMMIT} missing, using ${GKI_BRANCH}"
+            git checkout --force FETCH_HEAD
+          fi
+          git log -1 --oneline
+
+      - name: Configure and modules_prepare
+        run: |
+          set -eux
+          export PATH="/usr/lib/llvm-14/bin:$PATH"
+          cd kernel/common
+          if [ -f arch/arm64/configs/gki_defconfig ]; then
+            make LLVM=1 ARCH=arm64 gki_defconfig
+          elif [ -f arch/arm64/configs/gki_aarch64_defconfig ]; then
+            make LLVM=1 ARCH=arm64 gki_aarch64_defconfig
+          else
+            make LLVM=1 ARCH=arm64 defconfig
+          fi
+          scripts/config --enable CONFIG_MODULES || true
+          scripts/config --enable CONFIG_MODULE_UNLOAD || true
+          scripts/config --enable CONFIG_KALLSYMS || true
+          scripts/config --enable CONFIG_KALLSYMS_ALL || true
+          scripts/config --enable CONFIG_PERF_EVENTS || true
+          scripts/config --enable CONFIG_HW_BREAKPOINT || true
+          scripts/config --disable CONFIG_MODULE_SIG_FORCE || true
+          scripts/config --disable CONFIG_TRIM_UNUSED_KSYMS || true
+          scripts/config --enable CONFIG_KPROBES || true
+          scripts/config --enable CONFIG_MODVERSIONS || true
+          scripts/config --disable CONFIG_LTO_NONE || true
+          scripts/config --disable CONFIG_LTO_CLANG_FULL || true
+          scripts/config --enable CONFIG_LTO_CLANG_THIN || true
+          scripts/config --enable CONFIG_LTO_CLANG || true
+          scripts/config --enable CONFIG_LTO || true
+          scripts/config --enable CONFIG_CFI_CLANG || true
+          scripts/config --enable CONFIG_CFI_CLANG_SHADOW || true
+          make LLVM=1 ARCH=arm64 olddefconfig
+          grep -E 'CONFIG_LTO|CONFIG_CFI|CONFIG_MODVERSIONS|CONFIG_KPROBES' .config | head -n 40 || true
+          grep -q '^CONFIG_CFI_CLANG=y' .config
+          make LLVM=1 ARCH=arm64 prepare modules_prepare -j"$(nproc)"
+          if [ ! -s Module.symvers ]; then
+            echo "Building in-tree modules to generate Module.symvers..."
+            make LLVM=1 ARCH=arm64 modules -j"$(nproc)" || \
+              make LLVM=1 ARCH=arm64 modules -j2
+          fi
+          test -f include/generated/autoconf.h
+          if [ -s Module.symvers ]; then
+            cp -f Module.symvers Module.symvers.fullbak
+            wc -l Module.symvers
+          else
+            : > Module.symvers.fullbak
+          fi
+          # Report tree version (source follows LINUX_VERSION_CODE, no pin)
+          grep -E 'LINUX_VERSION|UTS_RELEASE|SUBLEVEL' include/generated/uapi/linux/version.h include/config/kernel.release 2>/dev/null || true
+          cat include/config/kernel.release || true
+
+      - name: Build merged_module.ko (lsnbm empty-CRC, no py)
+        run: |
+          set -eux
+          export PATH="/usr/lib/llvm-14/bin:$PATH"
+          KDIR="$GITHUB_WORKSPACE/kernel/common"
+          MDIR="$GITHUB_WORKSPACE/driver/kernel"
+          test -f "$MDIR/Makefile"
+          cd "$KDIR"
+          # Hide Module.symvers so modpost cannot import symbol CRCs (lsnbm NO_CRC).
+          if [ -f Module.symvers ]; then
+            mv Module.symvers Module.symvers.no_crc_bak
+          fi
+          : > Module.symvers
+          make -C "$KDIR" M="$MDIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
+            KBUILD_MODPOST_WARN=1 \
+            modules -j"$(nproc)"
+          if [ -f Module.symvers.no_crc_bak ]; then
+            mv Module.symvers.no_crc_bak Module.symvers
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/out/ko"
+          cp -v "$MDIR"/merged_module.ko "$GITHUB_WORKSPACE/out/ko/"
+          {
+            echo "device=Redmi K60 Pro (target)"
+            echo "uname_hint=5.15.189-android13-8-00012-g742fd6fce289-ab14327796"
+            echo "gki_repo=https://android.googlesource.com/kernel/common"
+            echo "gki_branch=${GKI_BRANCH}"
+            echo "gki_commit_requested=${GKI_COMMIT}"
+            echo "gki_commit_built=$(git -C "$KDIR" rev-parse HEAD)"
+            echo "kernel_release=$(cat "$KDIR/include/config/kernel.release" 2>/dev/null || true)"
+            echo "clang=$(clang --version | head -n1)"
+            echo "module=merged_module.ko"
+            echo "layout=kernel/ single-node R/W+search+HWBP"
+            echo "build_style=lsnbm-empty-crc+fno-sanitize=cfi+source-pac-landing+runtime-slowpath"
+            echo "post_link_py=none"
+            echo "cfi_check=source paciasp;autiasp;ret in merged_main.c"
+            echo "load=insmod merged_module.ko (root); init patches __cfi_slowpath"
+          } | tee "$GITHUB_WORKSPACE/out/ko/BUILD_INFO.txt"
+          ls -la "$GITHUB_WORKSPACE/out/ko"
+          llvm-nm "$GITHUB_WORKSPACE/out/ko/merged_module.ko" | grep -E 'init_module|cleanup_module|__cfi' || true
+          # Fail if residual BRK stub (paciasp;brk) instead of PAC landing
+          python3 "$GITHUB_WORKSPACE/driver/scripts/verify_cfi_check.py" \
+            "$GITHUB_WORKSPACE/out/ko/merged_module.ko"
+          llvm-readelf -n "$GITHUB_WORKSPACE/out/ko/merged_module.ko" 2>/dev/null | head -n 20 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: merged-module-gki515
+          path: out/ko/
+          if-no-files-found: error
