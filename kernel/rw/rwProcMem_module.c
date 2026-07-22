@@ -238,18 +238,15 @@ static ssize_t OnCmdGetProcessMapsList(struct ioctl_request *hdr, char __user* b
 
 static ssize_t OnCmdCheckProcessPhyAddr(struct ioctl_request *hdr, char __user* buf) {
 	struct pid * proc_pid_struct = proc_handle_get(hdr->param1);
+	size_t proc_virt_addr = (size_t)hdr->param2;
+	size_t phy;
+	ssize_t ret;
 	if (!proc_pid_struct)
 		return -EINVAL;
-	size_t proc_virt_addr = (size_t)hdr->param2;
-	pte_t *pte;
-	printk_debug(KERN_INFO "CMD_CHECK_PROCESS_ADDR_PHY\n");
-	printk_debug(KERN_INFO "proc_pid_struct *:0x%p,size:%ld\n", (void*)proc_pid_struct, sizeof(proc_pid_struct));
-	printk_debug(KERN_INFO "proc_virt_addr :0x%zx\n", proc_virt_addr);
-	if (get_proc_phy_addr(proc_pid_struct, proc_virt_addr, &pte)) {
-		return 1;
-	}
+	phy = get_proc_phy_addr(proc_pid_struct, proc_virt_addr, NULL);
+	ret = phy ? 1 : 0;
 	release_proc_pid_struct(proc_pid_struct);
-	return 0;
+	return ret;
 }
 
 static ssize_t OnCmdGetPidList(struct ioctl_request *hdr, char __user* buf) {
