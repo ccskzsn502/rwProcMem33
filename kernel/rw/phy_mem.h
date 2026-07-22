@@ -28,7 +28,6 @@ static inline size_t write_ram_physical_addr(size_t phy_addr, char* lpBuf, bool 
 #include <asm/uaccess.h>
 #include <linux/slab.h>
 #include <linux/rcupdate.h>
-#include "proc_maps_auto_offset.h"
 
 #if MY_LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,83)
 #include <linux/sched/task.h>
@@ -83,42 +82,72 @@ static inline size_t va_to_pa_mm(struct mm_struct *mm, size_t virt_addr, pte_t *
 }
 
 static inline size_t get_proc_phy_addr(struct pid* proc_pid_struct, size_t virt_addr, pte_t** out_pte) {
-		struct task_struct* task;
-		struct mm_struct *mm;
-		size_t paddr;
+	struct task_struct* task;
+	struct mm_struct *mm;
+	size_t paddr;
+	pte_t *pte_local = NULL;
 
-		if (out_pte)
-			*out_pte = NULL;
-		if (!proc_pid_struct)
-			return 0;
+	if (out_pte)
+		*out_pte = NULL;
+	if (!proc_pid_struct)
+		return 0;
 
-		rcu_read_lock();
-		task = pid_task(proc_pid_struct, PIDTYPE_PID);
-		if (task)
-			get_task_struct(task);
-		rcu_read_unlock();
-		if (!task)
-			return 0;
+	rcu_read_lock();
+	task = pid_task(proc_pid_struct, PIDTYPE_PID);
+	if (task)
+		get_task_struct(task);
+	rcu_read_unlock();
+	if (!task)
+		return 0;
 
-		mm = get_task_mm(task);
-		put_task_struct(task);
-		if (!mm)
-			return 0;
+	mm = get_task_mm(task);
+	put_task_struct(task);
+	if (!mm)
+		return 0;
 
-		if (down_read_mmap_lock(mm) != 0) {
-			mmput(mm);
-			return 0;
-		}
-		paddr = va_to_pa_mm(mm, virt_addr, out_pte);
-		if (out_pte && *out_pte) {
-			if (pte_none(**out_pte) || !pte_present(**out_pte)) {
-				*out_pte = NULL;
-				paddr = 0;
-			}
-		}
-		up_read_mmap_lock(mm);
-		mmput(mm);
-		return paddr;
+	/* 5.10+ mmap_lock; hold for walk only */
+	mmap_read_lock(mm);
+	paddr = va_to_pa_mm(mm, virt_addr, &pte_local);
+	if (pte_local && (pte_none(*pte_local) || !pte_present(*pte_local)))
+		paddr = 0;
+	/* Do not return pte* — not valid after unlock */
+	if (out_pte)
+		*out_pte = NULL;
+	mmap_read_unlock(mm);
+	mmput(mm);
+	return paddr;
+}
+
+
+static inline int is_pte_can_read(pte_t* pte) {
+						if (!pte) { return 0; }
+#ifdef pte_read
+						if (pte_read(*pte)) { return 1; } else { return 0; }
+#endif
+						return 1;
+					}
+static inline int is_pte_can_write(pte_t* pte) {
+	if (!pte) { return 0; }
+	if (pte_write(*pte)) { return 1; } else { return 0; }
+}
+static inline int is_pte_can_exec(pte_t* pte) {
+	if (!pte) { return 0; }
+#ifdef pte_exec
+	if (pte_exec(*pte)) { return 1; } else { return 0; }
+#endif
+#ifdef pte_user_exec
+	if (pte_user_exec(*pte)) { return 1; } else { return 0; }
+#endif
+	return 0;
+}
+static inline int change_pte_read_status(pte_t* pte, bool can_read) {
+	if (!pte) { return 0; }
+	return 1;
+}
+static inline int change_pte_write_status(pte_t* pte, bool can_write) {
+	if (!pte) { return 0; }
+	if (can_write) {
+		set_pte(pte, x_pte_mkwrite(*pte));
 	} else {
 		set_pte(pte, pte_wrprotect(*pte));
 	}
